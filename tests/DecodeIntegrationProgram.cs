@@ -51,10 +51,25 @@ try
     var wide = Path.Combine(folder, "wide.png");
     CreatePng(png, 96, 64);
     CreateJpeg(jpeg);
-    CreatePng(tall, 2, 3000);
-    CreatePng(wide, 3000, 2);
+    CreatePng(tall, 10, 30000);
+    CreatePng(wide, 30000, 10);
 
-    foreach (var file in new[] { png, jpeg, tall, wide })
+    // 16-bit grayscale PNG exercises non-8-bit source format inspection.
+    var gray = Path.Combine(folder, "gray16.png");
+    var grayData = new byte[64 * 32 * 2];
+    for (var i = 0; i < grayData.Length; i += 2)
+    {
+        grayData[i] = (byte)(i & 0xff);
+        grayData[i + 1] = 128;
+    }
+    var grayBitmap = BitmapSource.Create(64, 32, 96, 96,
+        PixelFormats.Gray16, null, grayData, 64 * 2);
+    grayBitmap.Freeze();
+    var grayEncoder = new PngBitmapEncoder();
+    grayEncoder.Frames.Add(BitmapFrame.Create(grayBitmap));
+    using (var output = File.Create(gray)) grayEncoder.Save(output);
+
+    foreach (var file in new[] { png, jpeg, tall, wide, gray })
     {
         var preview = await ImageLoader.PreviewAsync(file, 600, 400, CancellationToken.None);
         Assert(preview.IsFrozen && preview.PixelWidth > 0 && preview.PixelHeight > 0,
