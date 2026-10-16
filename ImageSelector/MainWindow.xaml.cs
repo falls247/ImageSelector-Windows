@@ -239,7 +239,7 @@ public partial class MainWindow : Window
                 token.ThrowIfCancellationRequested();
                 var selectedFolder = GetSelectedFolder(fullFolder);
                 var selected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                if (Directory.Exists(selectedFolder))
+                if (FileOps.DirectoryExists(selectedFolder))
                 {
                     var scanned = 0;
                     foreach (var path in Directory.EnumerateFiles(selectedFolder, "*", options))
@@ -251,7 +251,7 @@ public partial class MainWindow : Window
                         {
                             if (File.GetLastWriteTimeUtc(path) < DateTime.UtcNow.AddHours(-24))
                             {
-                                try { File.Delete(path); }
+                                try { FileOps.DeleteFile(path); }
                                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
                             }
                             continue;
@@ -791,14 +791,14 @@ public partial class MainWindow : Window
 
         try
         {
-            await Task.Run(() => Directory.CreateDirectory(selectedFolder), token);
+            await Task.Run(() => FileOps.CreateDirectory(selectedFolder), token);
 
             // 先にJSONの一時ファイルを完成させる。失敗時に画像だけ残さないため。
             tempJson = Path.Combine(selectedFolder, $".{Guid.NewGuid():N}.json.tmp");
             await Task.Run(async () =>
                 await File.WriteAllTextAsync(tempJson, contents, new UTF8Encoding(false), token), token);
 
-            if (!await Task.Run(() => File.Exists(target), token))
+            if (!await Task.Run(() => FileOps.FileExists(target), token))
             {
                 // 画像を同じフォルダ内の一時ファイルへコピーしてから正式名へ移動。
                 tempImage = Path.Combine(selectedFolder, $".{Guid.NewGuid():N}.image.tmp");
@@ -815,13 +815,13 @@ public partial class MainWindow : Window
                     await input.CopyToAsync(output, token);
                     await output.FlushAsync(token);
                 }, token);
-                await Task.Run(() => File.Move(tempImage, target, overwrite: false), token);
+                await Task.Run(() => FileOps.MoveFile(tempImage, target, overwrite: false), token);
                 tempImage = null;
                 createdImage = true;
             }
 
             // 既存JSONは原子リネームで更新。既存画像のバイト列は変更しない。
-            await Task.Run(() => File.Move(tempJson, targetJson, overwrite: true), token);
+            await Task.Run(() => FileOps.MoveFile(tempJson, targetJson, overwrite: true), token);
             tempJson = null;
             if (_isClosing) return;
             _metadataExists.Add(fileName + ".json");
@@ -836,7 +836,7 @@ public partial class MainWindow : Window
         {
             if (createdImage)
             {
-                try { await Task.Run(() => File.Delete(target)); }
+                try { await Task.Run(() => FileOps.DeleteFile(target)); }
                 catch (IOException) { /* recover on next launch */ }
                 catch (UnauthorizedAccessException) { }
             }
@@ -845,7 +845,7 @@ public partial class MainWindow : Window
         {
             if (createdImage)
             {
-                try { await Task.Run(() => File.Delete(target)); }
+                try { await Task.Run(() => FileOps.DeleteFile(target)); }
                 catch (IOException) { /* ロールバックできない場合は再試行 */ }
                 catch (UnauthorizedAccessException) { }
             }
@@ -860,7 +860,7 @@ public partial class MainWindow : Window
                 foreach (var temporary in leftovers)
                 {
                     if (temporary is null) continue;
-                    try { File.Delete(temporary); }
+                    try { FileOps.DeleteFile(temporary); }
                     catch (IOException) { /* 使用中ファイルの削除不可 */ }
                     catch (UnauthorizedAccessException) { /* 削除権限なし */ }
                 }
@@ -899,9 +899,9 @@ public partial class MainWindow : Window
         {
             var hadImage = await Task.Run(() =>
             {
-                var imageExists = File.Exists(selectedImage);
-                if (imageExists) File.Delete(selectedImage);
-                if (File.Exists(selectedJson)) File.Delete(selectedJson);
+                var imageExists = FileOps.FileExists(selectedImage);
+                if (imageExists) FileOps.DeleteFile(selectedImage);
+                if (FileOps.FileExists(selectedJson)) FileOps.DeleteFile(selectedJson);
                 return imageExists;
             });
             if (_isClosing) return;
@@ -963,11 +963,10 @@ public partial class MainWindow : Window
             ImageDisplay.Source = null;
             await RunOnStaThreadAsync(() =>
             {
-                if (!File.Exists(source))
+                if (!FileOps.FileExists(source))
                     throw new FileNotFoundException("元画像が見つからない", source);
-                FileSystem.DeleteFile(source, UIOption.OnlyErrorDialogs,
-                    RecycleOption.SendToRecycleBin, UICancelOption.ThrowException);
-                if (File.Exists(source))
+                FileOps.DeleteToRecycleBin(source);
+                if (FileOps.FileExists(source))
                     throw new IOException("元画像が残っているため、削除完了を確認できない");
             });
             if (_isClosing) return;
