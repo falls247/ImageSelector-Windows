@@ -795,22 +795,26 @@ public partial class MainWindow : Window
 
             // 先にJSONの一時ファイルを完成させる。失敗時に画像だけ残さないため。
             tempJson = Path.Combine(selectedFolder, $".{Guid.NewGuid():N}.json.tmp");
-            await File.WriteAllTextAsync(tempJson, contents, new UTF8Encoding(false), token);
+            await Task.Run(async () =>
+                await File.WriteAllTextAsync(tempJson, contents, new UTF8Encoding(false), token), token);
 
             if (!await Task.Run(() => File.Exists(target), token))
             {
                 // 画像を同じフォルダ内の一時ファイルへコピーしてから正式名へ移動。
                 tempImage = Path.Combine(selectedFolder, $".{Guid.NewGuid():N}.image.tmp");
-                await using (var input = new FileStream(
-                    source, FileMode.Open, FileAccess.Read, FileShare.Read,
-                    bufferSize: 1024 * 1024, options: FileOptions.Asynchronous | FileOptions.SequentialScan))
-                await using (var output = new FileStream(
-                    tempImage, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                    bufferSize: 1024 * 1024, options: FileOptions.Asynchronous))
+                var staged = tempImage;
+                await Task.Run(async () =>
                 {
+                    await using var input = new FileStream(
+                        source, FileMode.Open, FileAccess.Read, FileShare.Read,
+                        bufferSize: 1024 * 1024,
+                        options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+                    await using var output = new FileStream(
+                        staged, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                        bufferSize: 1024 * 1024, options: FileOptions.Asynchronous);
                     await input.CopyToAsync(output, token);
                     await output.FlushAsync(token);
-                }
+                }, token);
                 await Task.Run(() => File.Move(tempImage, target, overwrite: false), token);
                 tempImage = null;
                 createdImage = true;
