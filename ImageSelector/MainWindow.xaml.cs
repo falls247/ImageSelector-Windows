@@ -43,6 +43,7 @@ public partial class MainWindow : Window
     private CancellationTokenSource _thumbnailLoadCts = new();
     private CancellationTokenSource? _previewLoadCts;
     private CancellationTokenSource? _folderLoadCts;
+    private readonly CancellationTokenSource _lifetimeCts = new();
     private bool _isClosing;
     private bool _folderPickerOpen;
     private ThumbnailItem? _highlightedThumbnail;
@@ -145,6 +146,7 @@ public partial class MainWindow : Window
         _resizeTimer.Stop();
         _thumbnailLayoutTimer.Stop();
         _folderLoadCts?.Cancel();
+        _lifetimeCts.Cancel();
         _previewLoadCts?.Cancel();
         _thumbnailLoadCts.Cancel();
         ImageDisplay.Source = null;
@@ -452,6 +454,7 @@ public partial class MainWindow : Window
 
     private void UpdateControls()
     {
+        if (_isClosing) return;
         var hasImage = _imageFiles.Count > 0;
         // Cached selection state: avoid redundant synchronous I/O for every keypress.
         var hasSelectedCopy = hasImage && _thumbnailItems[_currentIndex].IsSaved;
@@ -569,6 +572,8 @@ public partial class MainWindow : Window
 
         try
         {
+            if (new FileInfo(jsonPath).Length > 2 * 1024 * 1024)
+                throw new InvalidDataException("注釈JSONが上限2MBを超えています");
             var data = JsonSerializer.Deserialize<ImageMetadata>(File.ReadAllText(jsonPath, Encoding.UTF8), JsonOptions);
             if (data is null || data.SchemaVersion != 1 || data.ImageFile != Path.GetFileName(source))
             {
@@ -618,6 +623,7 @@ public partial class MainWindow : Window
             SavedAt = DateTimeOffset.Now
         };
         var contents = JsonSerializer.Serialize(metadata, JsonOptions);
+        var token = _lifetimeCts.Token;
 
         _fileOperationInProgress = true;
         UpdateControls();
@@ -627,7 +633,7 @@ public partial class MainWindow : Window
 
             // 先にJSONの一時ファイルを完成させる。失敗時に画像だけ残さないため。
             tempJson = Path.Combine(selectedFolder, $".{Guid.NewGuid():N}.json.tmp");
-            await File.WriteAllTextAsync(tempJson, contents, new UTF8Encoding(false));
+            await File.WriteAllTextAsync(tempJson, contents, new UTF8Encoding(false), token);
 
             if (!File.Exists(target))
             {
@@ -640,8 +646,8 @@ public partial class MainWindow : Window
                     tempImage, FileMode.CreateNew, FileAccess.Write, FileShare.None,
                     bufferSize: 1024 * 1024, options: FileOptions.Asynchronous))
                 {
-                    await input.CopyToAsync(output);
-                    await output.FlushAsync();
+                    await input.CopyToAsync(output, token);
+                    await output.FlushAsync(token);
                 }
                 File.Move(tempImage, target, overwrite: false);
                 tempImage = null;
@@ -657,6 +663,10 @@ public partial class MainWindow : Window
             var status = createdImage ? "画像＋注釈JSONを保存" : "既存画像の注釈JSONを更新";
             NavigateAfterSelection();
             ShowNotification($"{status}: {fileName}（{metadata.Annotations.Count} 件）", NotificationKind.Success);
+        }
+        catch (OperationCanceledException) when (_isClosing)
+        {
+            // Window is closing; temporary files are removed in finally.
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {
@@ -680,7 +690,7 @@ public partial class MainWindow : Window
                 catch (UnauthorizedAccessException) { /* 削除権限なし */ }
             }
             _fileOperationInProgress = false;
-            UpdateControls();
+            if (!_isClosing) UpdateControls();
         }
     }
 
