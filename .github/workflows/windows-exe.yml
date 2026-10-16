@@ -31,7 +31,7 @@ jobs:
         shell: pwsh
         run: dotnet run --project .\tests\DecodePolicyChecks.csproj -c Release
       - name: Publish self-contained EXE
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
         shell: pwsh
         run: >-
           dotnet publish .\ImageSelector\ImageSelector.csproj
@@ -40,7 +40,7 @@ jobs:
           -p:IncludeNativeLibrariesForSelfExtract=true
           -o .\publish
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
         with:
           name: ImageSelector-win-x64
           path: publish/ImageSelector.exe
