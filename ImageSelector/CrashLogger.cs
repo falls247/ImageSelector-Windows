@@ -1,14 +1,16 @@
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Threading;
 
 namespace ImageSelector;
 
-/// <summary>Best-effort bounded crash diagnostics. Logging must never crash the UI.</summary>
+/// <summary>Cross-process serialized log writes, bounded rotation and PID-level diagnostics.</summary>
 internal static class CrashLogger
 {
     private static readonly object Sync = new();
-    private const long MaxLogBytes = 4 * 1024 * 1024;
+    private const string LockName = @"Local\falls247.ImageSelector.log";
+    private const long MaxLogBytes = 4L * 1024 * 1024;
 
     internal static string LogPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -16,20 +18,41 @@ internal static class CrashLogger
 
     private static void Append(string message)
     {
+        var pid = Environment.ProcessId;
+        var prefix = $"[{DateTimeOffset.Now:O}] PID={pid} TID={Environment.CurrentManagedThreadId} ";
         try
         {
             lock (Sync)
             {
-                var path = LogPath;
-                var directory = Path.GetDirectoryName(path);
-                if (directory is not null) Directory.CreateDirectory(directory);
-                // Rotates before append to avoid infinite error spam consuming system disk.
-                if (File.Exists(path) && new FileInfo(path).Length >= MaxLogBytes)
-                    File.Move(path, path + ".previous", overwrite: true);
-                File.AppendAllText(path, $"[{DateTimeOffset.Now:O}] {message}{Environment.NewLine}", Encoding.UTF8);
+                using var mutex = new Mutex(false, LockName);
+                var acquired = false;
+                try
+                {
+                    try { acquired = mutex.WaitOne(200); }
+                    catch (AbandonedMutexException) { acquired = true; }
+                    var path = acquired ? LogPath :
+                        Path.Combine(Path.GetDirectoryName(LogPath)!, $"error.{pid}.log");
+                    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                    for (var attempt = 0; attempt < 3; attempt++)
+                    {
+                        try
+                        {
+                            if (acquired && File.Exists(path) &&
+                                new FileInfo(path).Length >= MaxLogBytes)
+                                File.Move(path, path + ".previous", overwrite: true);
+                            using var stream = new FileStream(path, FileMode.Append, FileAccess.Write,
+                                FileShare.ReadWrite | FileShare.Delete);
+                            using var writer = new StreamWriter(stream, new UTF8Encoding(false));
+                            writer.WriteLine(prefix + message);
+                            return;
+                        }
+                        catch (IOException) when (attempt < 2) { Thread.Sleep(50); }
+                    }
+                }
+                finally { if (acquired) mutex.ReleaseMutex(); }
             }
         }
-        catch { /* diagnostics are never critical to application control */ }
+        catch { /* diagnostics must not impact application behavior */ }
     }
 
     internal static void Trace(string message) => Append(message);
@@ -39,11 +62,11 @@ internal static class CrashLogger
         try
         {
             using var process = Process.GetCurrentProcess();
-            Append($"{context} PID={process.Id} privateMB={process.PrivateMemorySize64 / 1048576}" +
-                $" workingMB={process.WorkingSet64 / 1048576} threads={process.Threads.Count} handles={process.HandleCount}" +
-                $" managedMB={GC.GetTotalMemory(false) / 1048576}");
+            Append($"{context} privateMB={process.PrivateMemorySize64 / 1048576}" +
+                $" workingMB={process.WorkingSet64 / 1048576} threads={process.Threads.Count}" +
+                $" handles={process.HandleCount} managedMB={GC.GetTotalMemory(false) / 1048576}");
         }
-        catch { /* best effort */ }
+        catch { /* process may have exited */ }
     }
 
     internal static void Write(string context, Exception exception) =>
