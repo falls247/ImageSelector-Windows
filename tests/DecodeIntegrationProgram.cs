@@ -54,6 +54,31 @@ try
     CreatePng(tall, 10, 30000);
     CreatePng(wide, 30000, 10);
 
+    // Exercise all declared image extensions, not only PNG and JPEG.
+    var pixelsOther = new byte[96 * 64 * 4];
+    for (var n = 0; n < pixelsOther.Length; n += 4)
+    {
+        pixelsOther[n] = 70;
+        pixelsOther[n + 1] = 140;
+        pixelsOther[n + 2] = 220;
+        pixelsOther[n + 3] = 255;
+    }
+    var baseRaster = BitmapSource.Create(96, 64, 96, 96,
+        PixelFormats.Bgra32, null, pixelsOther, 96 * 4);
+    baseRaster.Freeze();
+    var bmp = Path.Combine(folder, "test.bmp");
+    var gif = Path.Combine(folder, "test.gif");
+    var tiff = Path.Combine(folder, "test.tiff");
+    foreach (var sample in new (BitmapEncoder Encoder, string File)[]
+    {
+        (new BmpBitmapEncoder(), bmp), (new GifBitmapEncoder(), gif), (new TiffBitmapEncoder(), tiff)
+    })
+    {
+        sample.Encoder.Frames.Add(BitmapFrame.Create(baseRaster));
+        using var output = File.Create(sample.File);
+        sample.Encoder.Save(output);
+    }
+
     // 16-bit grayscale PNG exercises non-8-bit source format inspection.
     var gray = Path.Combine(folder, "gray16.png");
     var grayData = new byte[64 * 32 * 2];
@@ -69,7 +94,7 @@ try
     grayEncoder.Frames.Add(BitmapFrame.Create(grayBitmap));
     using (var output = File.Create(gray)) grayEncoder.Save(output);
 
-    foreach (var file in new[] { png, jpeg, tall, wide, gray })
+    foreach (var file in new[] { png, jpeg, tall, wide, gray, bmp, gif, tiff })
     {
         var preview = await ImageLoader.PreviewAsync(file, 600, 400, CancellationToken.None);
         Assert(preview.IsFrozen && preview.PixelWidth > 0 && preview.PixelHeight > 0,
@@ -81,8 +106,8 @@ try
 
     var tiny = Path.Combine(folder, "tiny.png");
     CreatePng(tiny, 1, 1);
-    var bmp = await ImageLoader.PreviewAsync(tiny, 10, 10, CancellationToken.None);
-    Assert(bmp.PixelWidth == 1 && bmp.PixelHeight == 1, "1x1 picture decoded");
+    var tinyPreview = await ImageLoader.PreviewAsync(tiny, 10, 10, CancellationToken.None);
+    Assert(tinyPreview.PixelWidth == 1 && tinyPreview.PixelHeight == 1, "1x1 picture decoded");
 
     var invalid = Path.Combine(folder, "corrupt.jpg");
     await File.WriteAllTextAsync(invalid, "not a valid JPEG");
