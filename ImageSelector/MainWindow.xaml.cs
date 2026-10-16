@@ -36,12 +36,15 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<ThumbnailItem> _thumbnailItems = new();
     private List<ThumbnailRow> _thumbnailRows = new();
     private readonly DispatcherTimer _thumbnailLayoutTimer = new();
-    private readonly SemaphoreSlim _thumbnailDecodeSlots = new(3, 3);
+    private readonly SemaphoreSlim _thumbnailDecodeSlots = new(1, 1);
     private const int ThumbnailCacheLimit = 160;
     private readonly Queue<ThumbnailItem> _thumbnailCacheOrder = new();
-    private readonly SemaphoreSlim _previewDecodeSlots = new(2, 2);
+    private readonly SemaphoreSlim _previewDecodeSlots = new(1, 1);
     private CancellationTokenSource _thumbnailLoadCts = new();
     private CancellationTokenSource? _previewLoadCts;
+    private CancellationTokenSource? _folderLoadCts;
+    private bool _isClosing;
+    private bool _folderPickerOpen;
     private ThumbnailItem? _highlightedThumbnail;
     private int _thumbnailColumns = 1;
     private string? _currentFolder;
@@ -83,7 +86,7 @@ public partial class MainWindow : Window
         _resizeTimer.Tick += (_, _) =>
         {
             _resizeTimer.Stop();
-            if (!_fileOperationInProgress && _imageFiles.Count > 0) RenderCurrentImage();
+            if (!_isClosing && !_fileOperationInProgress && _imageFiles.Count > 0) RenderCurrentImage();
         };
 
         UpdateControls();
@@ -91,6 +94,7 @@ public partial class MainWindow : Window
 
     private void ImageViewport_SizeChanged(object sender, SizeChangedEventArgs e)
     {
+        if (_isClosing) return;
         // リサイズ中はデコードし直さず、操作が一段落してから表示解像度を合わせる。
         _resizeTimer.Stop();
         _resizeTimer.Start();
@@ -102,31 +106,56 @@ public partial class MainWindow : Window
         var pathArgument = Environment.GetCommandLineArgs().Skip(1).FirstOrDefault();
         if (!string.IsNullOrWhiteSpace(pathArgument) && Directory.Exists(pathArgument))
         {
-            LoadFolder(pathArgument);
+            _ = LoadFolderAsync(pathArgument);
             return;
         }
 
         // 初回起動時はフォルダ選択ダイアログを表示。
-        Dispatcher.BeginInvoke(new Action(ShowFolderPicker), DispatcherPriority.Background);
+        Dispatcher.BeginInvoke(new Action(() => { if (!_isClosing) ShowFolderPicker(); }), DispatcherPriority.Background);
     }
 
     private void ShowFolderPicker()
     {
-        var dialog = new OpenFolderDialog
+        if (_isClosing || _folderPickerOpen || _fileOperationInProgress) return;
+        _folderPickerOpen = true;
+        try
         {
-            Title = "画像が入っているフォルダを選択",
-            Multiselect = false
-        };
+            var dialog = new OpenFolderDialog
+            {
+                Title = "画像が入っているフォルダを選択",
+                Multiselect = false
+            };
+            if (_currentFolder is not null && Directory.Exists(_currentFolder))
+                dialog.InitialDirectory = _currentFolder;
 
-        if (_currentFolder is not null && Directory.Exists(_currentFolder))
-        {
-            dialog.InitialDirectory = _currentFolder;
+            if (dialog.ShowDialog(this) == true && !_isClosing)
+                _ = LoadFolderAsync(dialog.FolderName);
         }
+        finally
+        {
+            _folderPickerOpen = false;
+        }
+    }
 
-        if (dialog.ShowDialog(this) == true)
-        {
-            LoadFolder(dialog.FolderName);
-        }
+    // Do not wait for decoders or directory enumeration on the dispatcher during exit.
+    private void Window_Closed(object sender, EventArgs e)
+    {
+        _isClosing = true;
+        _notificationTimer.Stop();
+        _resizeTimer.Stop();
+        _thumbnailLayoutTimer.Stop();
+        _folderLoadCts?.Cancel();
+        _previewLoadCts?.Cancel();
+        _thumbnailLoadCts.Cancel();
+        ImageDisplay.Source = null;
+        ThumbnailList.ItemsSource = null;
+        foreach (var item in _thumbnailItems) item.Thumbnail = null;
+        _thumbnailCacheOrder.Clear();
+        _thumbnailRows.Clear();
+        _thumbnailItems.Clear();
+        _imageFiles.Clear();
+        _drafts.Clear();
+        _unsavedDrafts.Clear();
     }
 
     // 選択フォルダの兄弟ディレクトリに保存。例: D:\photos -> D:\photos_selected
@@ -140,23 +169,45 @@ public partial class MainWindow : Window
         return Path.Combine(parent, folderName + "_selected");
     }
 
-    private void LoadFolder(string folder)
+    private async Task LoadFolderAsync(string folder)
     {
+        if (_isClosing) return;
+        _folderLoadCts?.Cancel();
+        var request = new CancellationTokenSource();
+        _folderLoadCts = request;
+        var token = request.Token;
         try
         {
             CrashLogger.Trace("LoadFolder started: " + folder);
-            var loadStopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             var fullFolder = Path.GetFullPath(folder);
-            var images = Directory.EnumerateFiles(fullFolder, "*", System.IO.SearchOption.TopDirectoryOnly)
-                .Where(path => SupportedExtensions.Contains(Path.GetExtension(path)))
-                .OrderBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
-                .ToList();
-            CrashLogger.Trace($"LoadFolder enumerated: {images.Count} images");
+            // Directory enumeration and selected-copy scan can block on a slow disk/share.
+            var (images, existingSelectedFiles) = await Task.Run(() =>
+            {
+                var found = Directory.EnumerateFiles(fullFolder, "*", SearchOption.TopDirectoryOnly)
+                    .Where(path => SupportedExtensions.Contains(Path.GetExtension(path)))
+                    .OrderBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                token.ThrowIfCancellationRequested();
+                var selectedFolder = GetSelectedFolder(fullFolder);
+                var selected = Directory.Exists(selectedFolder)
+                    ? Directory.EnumerateFiles(selectedFolder, "*", SearchOption.TopDirectoryOnly)
+                        .Select(path => Path.GetFileName(path) ?? string.Empty)
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase)
+                    : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                token.ThrowIfCancellationRequested();
+                return (found, selected);
+            }, token);
+            if (_isClosing || token.IsCancellationRequested) return;
 
+            CrashLogger.Trace($"LoadFolder enumerated: {images.Count} images");
             _previewLoadCts?.Cancel();
-            _thumbnailLoadCts.Cancel();
+            var previousThumbnailLoad = _thumbnailLoadCts;
+            previousThumbnailLoad.Cancel();
             _thumbnailLoadCts = new CancellationTokenSource();
+            previousThumbnailLoad.Dispose();
             _thumbnailCacheOrder.Clear();
+            ImageDisplay.Source = null;
             _currentFolder = fullFolder;
             _drafts.Clear();
             _unsavedDrafts.Clear();
@@ -164,22 +215,11 @@ public partial class MainWindow : Window
             _imageFiles = images;
             _currentIndex = 0;
             _highlightedThumbnail = null;
-            var selectedFolder = GetSelectedFolder(fullFolder);
-
-            // 選択済み一覧は一度だけ取得。画像ごとのFile.Exists連発を避ける。
-            var existingSelectedFiles = Directory.Exists(selectedFolder)
-                ? Directory.EnumerateFiles(selectedFolder, "*", System.IO.SearchOption.TopDirectoryOnly)
-                    .Select(path => Path.GetFileName(path) ?? string.Empty)
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase)
-                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             _thumbnailItems.Clear();
             foreach (var image in images)
-            {
-                _thumbnailItems.Add(new ThumbnailItem(
-                    image,
+                _thumbnailItems.Add(new ThumbnailItem(image,
                     existingSelectedFiles.Contains(Path.GetFileName(image))));
-            }
             _selectedCount = _thumbnailItems.Count(item => item.IsSaved);
             RebuildThumbnailRows();
             FolderPathText.Text = fullFolder;
@@ -187,31 +227,34 @@ public partial class MainWindow : Window
             Title = $"Image Selector — 注釈付き選別 — {Path.GetFileName(Path.TrimEndingDirectorySeparator(fullFolder))}";
             _notificationTimer.Stop();
             NoticeBorder.Visibility = Visibility.Collapsed;
-            CrashLogger.Trace("LoadFolder thumbnails ready");
             RenderCurrentImage();
-            CrashLogger.Trace($"LoadFolder UI ready: {images.Count} files, {loadStopwatch.ElapsedMilliseconds} ms (preview/thumbnails decode asynchronously)");
-
+            CrashLogger.Trace($"LoadFolder UI ready: {images.Count} files, {clock.ElapsedMilliseconds} ms");
             if (images.Count == 0)
-            {
                 ShowNotification("対応画像が見つからないフォルダ", NotificationKind.Information);
-            }
         }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            // 画像形式、権限、フォルダ列挙、サムネイルUIなど、
-            // フォルダ選択中の未知の例外でもアプリ全体を終了させない。
+            if (_isClosing || token.IsCancellationRequested) return;
             CrashLogger.Write("LoadFolder: " + folder, ex);
             ShowNotification($"フォルダを開けない: {ex.Message}", NotificationKind.Error);
             MessageBox.Show(this,
                 $"フォルダ読み込みに失敗しました。\n\n{ex.Message}\n\n詳細ログ: {CrashLogger.LogPath}",
                 "Image Selector - 読み込みエラー", MessageBoxButton.OK, MessageBoxImage.Error);
         }
+        finally
+        {
+            if (ReferenceEquals(_folderLoadCts, request)) _folderLoadCts = null;
+            request.Dispose();
+        }
     }
 
     // 画像のデコードはバックグラウンド。フォルダを開いた後、一覧を待たずに最初の画像を要求する。
     private void RenderCurrentImage()
     {
+        if (_isClosing) return;
         _previewLoadCts?.Cancel();
+        _previewLoadCts?.Dispose();
         _previewLoadCts = new CancellationTokenSource();
         var token = _previewLoadCts.Token;
 
@@ -255,7 +298,7 @@ public partial class MainWindow : Window
             await _previewDecodeSlots.WaitAsync(token);
             acquired = true;
             var bitmap = await Task.Run(() => DecodePreview(path, targetWidth, targetHeight, token), token);
-            if (token.IsCancellationRequested || _imageFiles.Count == 0 ||
+            if (_isClosing || token.IsCancellationRequested || _imageFiles.Count == 0 ||
                 !string.Equals(_imageFiles[_currentIndex], path, StringComparison.OrdinalIgnoreCase)) return;
 
             ImageDisplay.Source = bitmap;
@@ -267,7 +310,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            if (token.IsCancellationRequested) return;
+            if (_isClosing || token.IsCancellationRequested) return;
             CrashLogger.Write("LoadPreviewAsync: " + path, ex);
             PlaceholderText.Text = $"画像を表示できない\n{ex.Message}\n\n→ で次の画像へ";
             PlaceholderText.Visibility = Visibility.Visible;
@@ -280,33 +323,38 @@ public partial class MainWindow : Window
 
     private static BitmapSource DecodePreview(string path, double targetWidth, double targetHeight, CancellationToken token)
     {
-        token.ThrowIfCancellationRequested();
-        int width;
-        int height;
-        using (var headerStream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-        {
-            // OnDemandなら寸法取得のために全画素をデコードしない。
-            var decoder = BitmapDecoder.Create(headerStream, BitmapCreateOptions.None, BitmapCacheOption.OnDemand);
-            if (decoder.Frames.Count == 0) throw new FileFormatException("画像フレームがありません");
-            width = decoder.Frames[0].PixelWidth;
-            height = decoder.Frames[0].PixelHeight;
-        }
-        if (width <= 0 || height <= 0) throw new FileFormatException("画像サイズが無効です");
-        token.ThrowIfCancellationRequested();
+        var (width, height) = ReadImageDimensions(path, token);
+        var size = ImageDecodePolicy.Preview(width, height, targetWidth, targetHeight);
+        return DecodeBitmap(path, size, token);
+    }
 
-        var scale = Math.Min(1.0, Math.Min(targetWidth / width, targetHeight / height));
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        var image = new BitmapImage();
-        image.BeginInit();
-        image.CacheOption = BitmapCacheOption.OnLoad;
-        image.CreateOptions = BitmapCreateOptions.None;
-        if (scale < 1.0)
-            image.DecodePixelWidth = Math.Max(1, (int)Math.Ceiling(width * scale));
-        image.StreamSource = stream;
-        image.EndInit();
-        image.Freeze();
+    private static (int Width, int Height) ReadImageDimensions(string path, CancellationToken token)
+    {
         token.ThrowIfCancellationRequested();
-        return image;
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        // OnDemand avoids decoding all pixels merely to retrieve dimensions.
+        var decoder = BitmapDecoder.Create(stream,
+            BitmapCreateOptions.DelayCreation | BitmapCreateOptions.IgnoreImageCache, BitmapCacheOption.OnDemand);
+        if (decoder.Frames.Count == 0) throw new FileFormatException("画像フレームがありません");
+        var frame = decoder.Frames[0];
+        return (frame.PixelWidth, frame.PixelHeight);
+    }
+
+    private static BitmapSource DecodeBitmap(string path, DecodeDimensions size, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var bitmap = new BitmapImage();
+        bitmap.BeginInit();
+        bitmap.CacheOption = BitmapCacheOption.OnLoad;
+        bitmap.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
+        if (size.Width > 0) bitmap.DecodePixelWidth = size.Width;
+        if (size.Height > 0) bitmap.DecodePixelHeight = size.Height;
+        bitmap.StreamSource = stream;
+        bitmap.EndInit();
+        bitmap.Freeze();
+        token.ThrowIfCancellationRequested();
+        return bitmap;
     }
 
     // 行単位の仮想化。WrapPanel直結では全500枚の要素が一度に生成されてしまう。
@@ -346,14 +394,14 @@ public partial class MainWindow : Window
 
     private void ThumbnailList_SizeChanged(object sender, SizeChangedEventArgs e)
     {
-        if (Math.Abs(e.NewSize.Width - e.PreviousSize.Width) < 1) return;
+        if (_isClosing || Math.Abs(e.NewSize.Width - e.PreviousSize.Width) < 1) return;
         _thumbnailLayoutTimer.Stop();
         _thumbnailLayoutTimer.Start();
     }
 
     private void ThumbnailTile_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        if (_fileOperationInProgress || sender is not FrameworkElement { DataContext: ThumbnailItem item }) return;
+        if (_isClosing || _fileOperationInProgress || sender is not FrameworkElement { DataContext: ThumbnailItem item }) return;
         var index = _thumbnailItems.IndexOf(item);
         if (index < 0 || index == _currentIndex) return;
         _currentIndex = index;
@@ -364,7 +412,7 @@ public partial class MainWindow : Window
     // Loadedは仮想化で画面内に現れたセルだけで発火する。最大3件まで並列デコード。
     private async void ThumbnailImage_Loaded(object sender, RoutedEventArgs e)
     {
-        if (sender is not Image { DataContext: ThumbnailItem item }) return;
+        if (_isClosing || sender is not Image { DataContext: ThumbnailItem item }) return;
         if (item.Thumbnail is not null || item.IsLoading) return;
         var token = _thumbnailLoadCts.Token;
         item.IsLoading = true;
@@ -374,7 +422,7 @@ public partial class MainWindow : Window
             await _thumbnailDecodeSlots.WaitAsync(token);
             acquired = true;
             var thumbnail = await Task.Run(() => DecodeThumbnail(item.Path, token), token);
-            if (!token.IsCancellationRequested)
+            if (!_isClosing && !token.IsCancellationRequested)
             {
                 item.Thumbnail = thumbnail;
                 _thumbnailCacheOrder.Enqueue(item);
@@ -385,7 +433,7 @@ public partial class MainWindow : Window
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            if (!token.IsCancellationRequested)
+            if (!_isClosing && !token.IsCancellationRequested)
                 CrashLogger.Write("ThumbnailImage_Loaded: " + item.Path, ex);
         }
         finally
@@ -397,29 +445,16 @@ public partial class MainWindow : Window
 
     private static BitmapSource DecodeThumbnail(string path, CancellationToken token)
     {
-        token.ThrowIfCancellationRequested();
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        var bitmap = new BitmapImage();
-        bitmap.BeginInit();
-        bitmap.CacheOption = BitmapCacheOption.OnLoad;
-        bitmap.CreateOptions = BitmapCreateOptions.None;
-        bitmap.DecodePixelWidth = 256;
-        bitmap.StreamSource = stream;
-        bitmap.EndInit();
-        bitmap.Freeze();
-        token.ThrowIfCancellationRequested();
-        return bitmap;
+        var (width, height) = ReadImageDimensions(path, token);
+        var size = ImageDecodePolicy.Thumbnail(width, height);
+        return DecodeBitmap(path, size, token);
     }
 
     private void UpdateControls()
     {
         var hasImage = _imageFiles.Count > 0;
-        var hasSelectedCopy = false;
-        if (hasImage && _currentFolder is not null)
-        {
-            var selectedFolderNow = GetSelectedFolder(_currentFolder);
-            hasSelectedCopy = File.Exists(Path.Combine(selectedFolderNow, Path.GetFileName(_imageFiles[_currentIndex])));
-        }
+        // Cached selection state: avoid redundant synchronous I/O for every keypress.
+        var hasSelectedCopy = hasImage && _thumbnailItems[_currentIndex].IsSaved;
 
         PreviousButton.IsEnabled = hasImage && !_fileOperationInProgress && _currentIndex > 0;
         NextButton.IsEnabled = hasImage && !_fileOperationInProgress && _currentIndex < _imageFiles.Count - 1;
@@ -439,8 +474,6 @@ public partial class MainWindow : Window
             return;
         }
 
-        var selectedFolder = GetSelectedFolder(_currentFolder);
-        var currentSelected = hasImage && File.Exists(Path.Combine(selectedFolder, Path.GetFileName(_imageFiles[_currentIndex])));
         SelectedCountText.Text = $"選択済み {_selectedCount}/{_imageFiles.Count}件";
         if (hasImage)
         {
@@ -457,7 +490,7 @@ public partial class MainWindow : Window
 
     private void Navigate(int direction)
     {
-        if (_fileOperationInProgress || _imageFiles.Count == 0)
+        if (_isClosing || _fileOperationInProgress || _imageFiles.Count == 0)
         {
             return;
         }
@@ -476,7 +509,7 @@ public partial class MainWindow : Window
     // サイドバー幅やサムネイル倍率を変更直後の場合は、まず行レイアウトを更新する。
     private void NavigateThumbnailVertical(int rowDirection)
     {
-        if (_fileOperationInProgress || _imageFiles.Count == 0 ||
+        if (_isClosing || _fileOperationInProgress || _imageFiles.Count == 0 ||
             ThumbnailList.Visibility != Visibility.Visible)
             return;
 
@@ -497,7 +530,7 @@ public partial class MainWindow : Window
 
     private async Task OpenAnnotationEditorAsync()
     {
-        if (_fileOperationInProgress || _imageFiles.Count == 0) return;
+        if (_isClosing || _fileOperationInProgress || _imageFiles.Count == 0) return;
 
         var current = _imageFiles[_currentIndex];
         // Alt+Enter は編集中の注釈だけをメモリ上の下書きへ反映し、画面は閉じない。
@@ -892,6 +925,7 @@ public partial class MainWindow : Window
 
     private void ThumbSizeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
+        if (_isClosing) return;
         if (ThumbScaleText is not null)
             ThumbScaleText.Text = $"{(int)Math.Round(e.NewValue)}%";
         if (_thumbnailLayoutTimer is not null)
