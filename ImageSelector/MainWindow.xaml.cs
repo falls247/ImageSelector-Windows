@@ -654,7 +654,8 @@ public partial class MainWindow : Window
 
         var current = _imageFiles[_currentIndex];
         await EnsureAnnotationsLoadedAsync(current);
-        if (_isClosing || !_imageFiles.Contains(current)) return;
+        if (_isClosing || _imageFiles.Count == 0 ||
+            !string.Equals(_imageFiles[_currentIndex], current, StringComparison.OrdinalIgnoreCase)) return;
         // Alt+Enter は編集中の注釈だけをメモリ上の下書きへ反映し、画面は閉じない。
         // Ctrl+Enter のみウィンドウを閉じ、画像とJSONの保存へ進む。
         var editor = new AnnotationEditor(
