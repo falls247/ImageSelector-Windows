@@ -56,7 +56,7 @@ public partial class MainWindow : Window
     private readonly Dictionary<string, List<ImageAnnotation>> _drafts = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _unsavedDrafts = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _metadataExists = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _metadataLoading = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, TaskCompletionSource<bool>> _metadataRequests = new(StringComparer.OrdinalIgnoreCase);
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -222,7 +222,7 @@ public partial class MainWindow : Window
             _unsavedDrafts.Clear();
             _invalidMetadata.Clear();
             _metadataExists.Clear();
-            _metadataLoading.Clear();
+            _metadataRequests.Clear();
             foreach (var name in existingSelectedFiles)
                 if (name.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
                     _metadataExists.Add(name);
@@ -567,9 +567,21 @@ public partial class MainWindow : Window
     // The UI displays "…" until the metadata for a new image has been loaded.
     private async Task EnsureAnnotationsLoadedAsync(string source)
     {
-        if (_isClosing || _drafts.ContainsKey(source) || !_metadataLoading.Add(source)) return;
+        if (_isClosing || _drafts.ContainsKey(source)) return;
+        if (_metadataRequests.TryGetValue(source, out var existing))
+        {
+            await existing.Task;
+            return;
+        }
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _metadataRequests[source] = completion;
         var folder = _currentFolder;
-        if (folder is null) { _metadataLoading.Remove(source); return; }
+        if (folder is null)
+        {
+            _metadataRequests.Remove(source);
+            completion.TrySetResult(true);
+            return;
+        }
         var token = _thumbnailLoadCts.Token;
         var jsonName = Path.GetFileName(source) + ".json";
         try
@@ -610,7 +622,9 @@ public partial class MainWindow : Window
         }
         finally
         {
-            _metadataLoading.Remove(source);
+            if (_metadataRequests.TryGetValue(source, out var active) &&
+                ReferenceEquals(active, completion)) _metadataRequests.Remove(source);
+            completion.TrySetResult(true);
             if (!_isClosing && _currentFolder == folder && _imageFiles.Count > 0 &&
                 string.Equals(_imageFiles[_currentIndex], source, StringComparison.OrdinalIgnoreCase))
                 UpdateControls();
@@ -627,9 +641,19 @@ public partial class MainWindow : Window
         if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _currentFolder is null || _imageFiles.Count == 0) return;
 
         var source = _imageFiles[_currentIndex];
+        _fileOperationInProgress = true;
+        UpdateControls();
+        await EnsureAnnotationsLoadedAsync(source);
+        if (_isClosing)
+        {
+            _fileOperationInProgress = false;
+            return;
+        }
         if (_invalidMetadata.Contains(source))
         {
             ShowNotification("既存JSONを読み取れないため上書きを停止。JSONを修復または退避してから再実行", NotificationKind.Error);
+            _fileOperationInProgress = false;
+            UpdateControls();
             return;
         }
 
@@ -651,17 +675,15 @@ public partial class MainWindow : Window
         var contents = JsonSerializer.Serialize(metadata, JsonOptions);
         var token = _lifetimeCts.Token;
 
-        _fileOperationInProgress = true;
-        UpdateControls();
         try
         {
-            Directory.CreateDirectory(selectedFolder);
+            await Task.Run(() => Directory.CreateDirectory(selectedFolder), token);
 
             // 先にJSONの一時ファイルを完成させる。失敗時に画像だけ残さないため。
             tempJson = Path.Combine(selectedFolder, $".{Guid.NewGuid():N}.json.tmp");
             await File.WriteAllTextAsync(tempJson, contents, new UTF8Encoding(false), token);
 
-            if (!File.Exists(target))
+            if (!await Task.Run(() => File.Exists(target), token))
             {
                 // 画像を同じフォルダ内の一時ファイルへコピーしてから正式名へ移動。
                 tempImage = Path.Combine(selectedFolder, $".{Guid.NewGuid():N}.image.tmp");
@@ -675,13 +697,13 @@ public partial class MainWindow : Window
                     await input.CopyToAsync(output, token);
                     await output.FlushAsync(token);
                 }
-                File.Move(tempImage, target, overwrite: false);
+                await Task.Run(() => File.Move(tempImage, target, overwrite: false), token);
                 tempImage = null;
                 createdImage = true;
             }
 
             // 既存JSONは原子リネームで更新。既存画像のバイト列は変更しない。
-            File.Move(tempJson, targetJson, overwrite: true);
+            await Task.Run(() => File.Move(tempJson, targetJson, overwrite: true), token);
             tempJson = null;
             if (createdImage) _selectedCount++;
             _thumbnailItems[_currentIndex].IsSaved = true;
@@ -702,19 +724,22 @@ public partial class MainWindow : Window
                 catch (IOException) { /* ロールバックできない場合、再試行で救済する */ }
                 catch (UnauthorizedAccessException) { /* 同上 */ }
             }
-            _selectedCount = _imageFiles.Count(path =>
-                File.Exists(Path.Combine(selectedFolder, Path.GetFileName(path))));
+            _selectedCount = _thumbnailItems.Count(item => item.IsSaved);
             ShowNotification($"保存失敗（画像を進めない）: {ex.Message}", NotificationKind.Error);
         }
         finally
         {
-            foreach (var temporary in new[] { tempImage, tempJson })
+            var leftovers = new[] { tempImage, tempJson };
+            await Task.Run(() =>
             {
-                if (temporary is null) continue;
-                try { File.Delete(temporary); }
-                catch (IOException) { /* 使用中ファイルの削除不可 */ }
-                catch (UnauthorizedAccessException) { /* 削除権限なし */ }
-            }
+                foreach (var temporary in leftovers)
+                {
+                    if (temporary is null) continue;
+                    try { File.Delete(temporary); }
+                    catch (IOException) { /* 使用中ファイルの削除不可 */ }
+                    catch (UnauthorizedAccessException) { /* 削除権限なし */ }
+                }
+            });
             _fileOperationInProgress = false;
             if (!_isClosing) UpdateControls();
         }
