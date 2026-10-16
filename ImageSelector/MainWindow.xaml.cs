@@ -142,6 +142,7 @@ public partial class MainWindow : Window
     private void Window_Closed(object sender, EventArgs e)
     {
         _isClosing = true;
+        CrashLogger.TraceResources("Window closed (before cleanup)");
         _notificationTimer.Stop();
         _resizeTimer.Stop();
         _thumbnailLayoutTimer.Stop();
