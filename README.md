@@ -112,6 +112,15 @@ JSON例：
 }
 ```
 
+## 修正レビューと画像表示の回帰不具合
+
+- [高速再起動レビューWI-01〜WI-13の対応状況](docs/review-followup-status.md)
+- 前回の「画像を表示できない」は、`BitmapImage.StreamSource` と `IgnoreImageCache` の併用による `ArgumentNullException` が原因。Windows上のWIC実画像デコード試験で再現後に修正済み。
+- **安全制限:** 画像ファイル256MiBまで、元画像80MP・1辺50,000px・展開元512MiBまで。超過画像は個別に読み込みを拒否して次画像へ進める。
+- 単一インスタンス化はWPF生成前に判定し、旧プロセスの終了を待つ。終了待機が長い場合は旧PIDを通知。
+- 注釈JSONはバックグラウンド読み込み（読み込み中は件数が「…」）。保存・元画像削除・選択取消もUIスレッド上でストレージI/Oを実施しない。
+- 保存中のクローズは最大10秒延期し、安全に終了を試みる。応答のないストレージには完全な中断保証はない。
+
 ## フリーズ調査・高速再起動検証
 
 Windows EXEの連続起動、画像デコード上限、再起動ストレステスト、イベントログ調査手順は [docs/rapid-relaunch-diagnostics.md](docs/rapid-relaunch-diagnostics.md) に記載。
