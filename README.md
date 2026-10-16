@@ -2,16 +2,39 @@
 
 Windows 10/11向けの **C# / WPF / .NET 10** デスクトップアプリ。画像の選別、男性・女性セリフ／キャプション／効果音／吹き出しの注釈入力、サイドカーJSONの保存を行う。元画像は保存時に変更しない。
 
-## 起動
+## ビルドとEXEの発行
 
-.NET 10 SDKをインストール済みのWindowsで、ZIP展開先の `ImageSelector-Windows` フォルダから実行:
+Windows 10/11（x64）と [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) が必要。以下のコマンドはリポジトリのルートでPowerShellから実行する。
+
+### 開発用ビルドと起動
 
 ```powershell
-dotnet build .\ImageSelector\ImageSelector.csproj
+dotnet build .\ImageSelector\ImageSelector.csproj -c Release
 dotnet run --project .\ImageSelector\ImageSelector.csproj
 ```
 
-アプリのウィンドウとビルド後のEXEには `ImageSelector/Assets/ImageSelector.ico` を設定済み。
+ビルドした実行ファイルは `ImageSelector\bin\Release\net10.0-windows\ImageSelector.exe`。この形式で実行するPCには.NET 10 Desktop Runtimeが必要。
+
+### 配布用の単一EXE
+
+以下は.NETランタイムを含む自己完結型の単一ファイルを `publish` フォルダへ発行する。配布先に.NETのインストールは不要。
+
+```powershell
+dotnet publish .\ImageSelector\ImageSelector.csproj `
+  -c Release `
+  -r win-x64 `
+  --self-contained true `
+  -p:PublishSingleFile=true `
+  -p:EnableCompressionInSingleFile=true `
+  -p:IncludeNativeLibrariesForSelfExtract=true `
+  -o .\publish
+```
+
+発行後は `publish\ImageSelector.exe` を起動する。対象はWindows 10/11のx64 PC。ARM64向けに発行する場合は `-r win-arm64` を指定する。アプリのウィンドウとEXEには `ImageSelector/Assets/ImageSelector.ico` を設定済み。
+
+### GitHub Actionsから取得
+
+GitHubの `Actions` → `Build Windows EXE` → `Run workflow` で発行を開始する。完了後、実行結果ページのArtifactsから `ImageSelector-win-x64` をダウンロードして展開する。push / pull request時はコンパイル確認のみ実行する。
 
 ## 操作
 
