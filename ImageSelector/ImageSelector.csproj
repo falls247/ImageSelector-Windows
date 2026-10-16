@@ -7,9 +7,13 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>ImageSelector</AssemblyName>
     <RootNamespace>ImageSelector</RootNamespace>
+    <StartupObject>ImageSelector.Program</StartupObject>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ApplicationIcon>Assets\ImageSelector.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
+    <ApplicationDefinition Remove="App.xaml" />
+    <None Include="App.xaml" />
     <Resource Include="Assets\ImageSelector.ico" />
   </ItemGroup>
 </Project>

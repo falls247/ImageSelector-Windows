@@ -30,6 +30,26 @@ jobs:
       - name: Check bounded decoding policy
         shell: pwsh
         run: dotnet run --project .\tests\DecodePolicyChecks.csproj -c Release
+      - name: Run real WIC image decode regression checks
+        shell: pwsh
+        run: dotnet run --project .\tests\DecodeIntegrationChecks.csproj -c Release
+      - name: Check cross-process single-instance ownership
+        shell: pwsh
+        run: |
+          dotnet build .\tests\InstanceProcessProbe.csproj -c Release
+          $exe = (Resolve-Path .\tests\bin\Release\net10.0-windows\InstanceProcessProbe.exe).Path
+          $owner = Start-Process -FilePath $exe -ArgumentList '--hold' -PassThru
+          try {
+            Start-Sleep -Milliseconds 800
+            if ($owner.HasExited) { throw 'Owner exited unexpectedly' }
+            $duplicate = Start-Process -FilePath $exe -Wait -PassThru
+            if ($duplicate.ExitCode -ne 7) { throw "Expected duplicate exit 7, got $($duplicate.ExitCode)" }
+            if (-not $owner.WaitForExit(8000)) { throw 'Owner did not exit' }
+            $restarted = Start-Process -FilePath $exe -Wait -PassThru
+            if ($restarted.ExitCode -ne 0) { throw 'Ownership not recovered after prior process exit' }
+          } finally {
+            if (-not $owner.HasExited) { $owner.Kill(); $owner.WaitForExit(5000) | Out-Null }
+          }
       - name: Publish self-contained EXE
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
         shell: pwsh

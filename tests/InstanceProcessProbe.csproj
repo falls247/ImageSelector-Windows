@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="InstanceProbeProgram.cs" />
+    <Compile Include="../ImageSelector/InstanceCoordinator.cs" Link="InstanceCoordinator.cs" />
+    <Compile Include="../ImageSelector/CrashLogger.cs" Link="CrashLogger.cs" />
+  </ItemGroup>
+</Project>

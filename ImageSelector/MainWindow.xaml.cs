@@ -38,7 +38,7 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _thumbnailLayoutTimer = new();
     private readonly SemaphoreSlim _thumbnailDecodeSlots = new(1, 1);
     private const int ThumbnailCacheLimit = 160;
-    private readonly Queue<ThumbnailItem> _thumbnailCacheOrder = new();
+    private readonly LinkedList<ThumbnailItem> _thumbnailCacheOrder = new();
     private readonly SemaphoreSlim _previewDecodeSlots = new(1, 1);
     private CancellationTokenSource _thumbnailLoadCts = new();
     private CancellationTokenSource? _previewLoadCts;
@@ -47,6 +47,8 @@ public partial class MainWindow : Window
     private bool _isClosing;
     private bool _folderPickerOpen;
     private bool _folderLoadInProgress;
+    private bool _closeRequested;
+    private bool _forceClose;
     private ThumbnailItem? _highlightedThumbnail;
     private int _thumbnailColumns = 1;
     private string? _currentFolder;
@@ -55,6 +57,8 @@ public partial class MainWindow : Window
     private bool _fileOperationInProgress;
     private readonly Dictionary<string, List<ImageAnnotation>> _drafts = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _unsavedDrafts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _metadataExists = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, TaskCompletionSource<bool>> _metadataRequests = new(StringComparer.OrdinalIgnoreCase);
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -64,6 +68,7 @@ public partial class MainWindow : Window
 
     public MainWindow()
     {
+        CrashLogger.Trace("MainWindow constructed");
         InitializeComponent();
         ThumbnailList.ItemsSource = _thumbnailRows;
 
@@ -106,7 +111,7 @@ public partial class MainWindow : Window
     {
         // コマンドラインにフォルダが指定されていたら、そのフォルダを開く。
         var pathArgument = Environment.GetCommandLineArgs().Skip(1).FirstOrDefault();
-        if (!string.IsNullOrWhiteSpace(pathArgument) && Directory.Exists(pathArgument))
+        if (!string.IsNullOrWhiteSpace(pathArgument))
         {
             _ = LoadFolderAsync(pathArgument);
             return;
@@ -128,8 +133,7 @@ public partial class MainWindow : Window
                 Title = "画像が入っているフォルダを選択",
                 Multiselect = false
             };
-            if (_currentFolder is not null && Directory.Exists(_currentFolder))
-                dialog.InitialDirectory = _currentFolder;
+            // Do not synchronously probe a network/WSL path on the dispatcher.
 
             if (dialog.ShowDialog(this) == true && !_isClosing)
                 _ = LoadFolderAsync(dialog.FolderName);
@@ -138,6 +142,36 @@ public partial class MainWindow : Window
         {
             _folderPickerOpen = false;
         }
+    }
+
+    private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
+    {
+        if (_fileOperationInProgress && !_forceClose)
+        {
+            e.Cancel = true;
+            if (_closeRequested) return;
+            _closeRequested = true;
+            ShowNotification("保存・削除処理が完了したら終了します", NotificationKind.Information);
+            var delay = new DispatcherTimer { Interval = TimeSpan.FromSeconds(10) };
+            delay.Tick += (_, _) =>
+            {
+                delay.Stop();
+                if (!_fileOperationInProgress || _isClosing) return;
+                CrashLogger.Trace("Close request timeout: cancelling ongoing file operation");
+                _lifetimeCts.Cancel();
+                _forceClose = true;
+                Close();
+            };
+            delay.Start();
+        }
+    }
+
+    private void FinishFileOperation()
+    {
+        _fileOperationInProgress = false;
+        if (!_isClosing) UpdateControls();
+        if (_closeRequested && !_isClosing)
+            Dispatcher.BeginInvoke(new Action(Close), DispatcherPriority.Background);
     }
 
     // Do not wait for decoders or directory enumeration on the dispatcher during exit.
@@ -191,17 +225,40 @@ public partial class MainWindow : Window
             // Directory enumeration and selected-copy scan can block on a slow disk/share.
             var (images, existingSelectedFiles) = await Task.Run(() =>
             {
-                var found = Directory.EnumerateFiles(fullFolder, "*", System.IO.SearchOption.TopDirectoryOnly)
-                    .Where(path => SupportedExtensions.Contains(Path.GetExtension(path)))
-                    .OrderBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
-                    .ToList();
+                var found = new List<string>();
+                var options = new EnumerationOptions { IgnoreInaccessible = true, RecurseSubdirectories = false };
+                foreach (var path in Directory.EnumerateFiles(fullFolder, "*", options))
+                {
+                    if ((found.Count & 127) == 0) token.ThrowIfCancellationRequested();
+                    if (!SupportedExtensions.Contains(Path.GetExtension(path))) continue;
+                    if (found.Count >= 20000) throw new InvalidDataException("画像の上限20,000件を超えています");
+                    found.Add(path);
+                }
+                found.Sort((left, right) => StringComparer.OrdinalIgnoreCase.Compare(
+                    Path.GetFileName(left), Path.GetFileName(right)));
                 token.ThrowIfCancellationRequested();
                 var selectedFolder = GetSelectedFolder(fullFolder);
-                var selected = Directory.Exists(selectedFolder)
-                    ? Directory.EnumerateFiles(selectedFolder, "*", System.IO.SearchOption.TopDirectoryOnly)
-                        .Select(path => Path.GetFileName(path) ?? string.Empty)
-                        .ToHashSet(StringComparer.OrdinalIgnoreCase)
-                    : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var selected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (FileOps.DirectoryExists(selectedFolder))
+                {
+                    var scanned = 0;
+                    foreach (var path in Directory.EnumerateFiles(selectedFolder, "*", options))
+                    {
+                        if ((scanned++ & 127) == 0) token.ThrowIfCancellationRequested();
+                        var name = Path.GetFileName(path);
+                        if (System.Text.RegularExpressions.Regex.IsMatch(name,
+                            @"^\.[0-9a-f]{32}\.(image|json)\.tmp$", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                        {
+                            if (File.GetLastWriteTimeUtc(path) < DateTime.UtcNow.AddHours(-24))
+                            {
+                                try { FileOps.DeleteFile(path); }
+                                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+                            }
+                            continue;
+                        }
+                        selected.Add(name);
+                    }
+                }
                 token.ThrowIfCancellationRequested();
                 return (found, selected);
             }, token);
@@ -218,6 +275,11 @@ public partial class MainWindow : Window
             _drafts.Clear();
             _unsavedDrafts.Clear();
             _invalidMetadata.Clear();
+            _metadataExists.Clear();
+            _metadataRequests.Clear();
+            foreach (var name in existingSelectedFiles)
+                if (name.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+                    _metadataExists.Add(name);
             _imageFiles = images;
             _currentIndex = 0;
             _highlightedThumbnail = null;
@@ -239,7 +301,7 @@ public partial class MainWindow : Window
                 ShowNotification("対応画像が見つからないフォルダ", NotificationKind.Information);
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) when (IsMemoryExhaustion(ex))
+        catch (Exception ex) when (IsFatalMemoryFailure(ex))
         {
             ShutDownAfterMemoryExhaustion("Folder enumeration", ex);
         }
@@ -264,12 +326,19 @@ public partial class MainWindow : Window
         }
     }
 
-    private static bool IsMemoryExhaustion(Exception exception) =>
-        exception is OutOfMemoryException || exception.HResult == unchecked((int)0x8007000E);
+    private static bool IsFatalMemoryFailure(Exception exception)
+    {
+        using var p = System.Diagnostics.Process.GetCurrentProcess();
+        return MemoryFailurePolicy.Classify(exception, p.PrivateMemorySize64) ==
+            MemoryFailureAction.ExitApplication;
+    }
 
     private static void ShutDownAfterMemoryExhaustion(string operation, Exception exception)
     {
         CrashLogger.Write(operation + ": fatal memory exhaustion", exception);
+        MessageBox.Show(
+            "メモリ不足のため安全に終了します。\n詳細ログ: " + CrashLogger.LogPath,
+            "Image Selector - メモリ不足", MessageBoxButton.OK, MessageBoxImage.Error);
         Application.Current.Shutdown(-1);
     }
 
@@ -311,6 +380,7 @@ public partial class MainWindow : Window
         var width = Math.Max(1, ImageViewport.ActualWidth * dpi.DpiScaleX * 1.25);
         var height = Math.Max(1, ImageViewport.ActualHeight * dpi.DpiScaleY * 1.25);
         _ = LoadPreviewAsync(path, width, height, token);
+        _ = EnsureAnnotationsLoadedAsync(path);
     }
 
     private async Task LoadPreviewAsync(string path, double targetWidth, double targetHeight, CancellationToken token)
@@ -320,7 +390,7 @@ public partial class MainWindow : Window
         {
             await _previewDecodeSlots.WaitAsync(token);
             acquired = true;
-            var bitmap = await Task.Run(() => DecodePreview(path, targetWidth, targetHeight, token), token);
+            var bitmap = await ImageLoader.PreviewAsync(path, targetWidth, targetHeight, token);
             if (_isClosing || token.IsCancellationRequested || _imageFiles.Count == 0 ||
                 !string.Equals(_imageFiles[_currentIndex], path, StringComparison.OrdinalIgnoreCase)) return;
 
@@ -331,7 +401,7 @@ public partial class MainWindow : Window
         {
             // 移動先の画像だけを表示する。
         }
-        catch (Exception ex) when (IsMemoryExhaustion(ex))
+        catch (Exception ex) when (IsFatalMemoryFailure(ex))
         {
             ShutDownAfterMemoryExhaustion("Preview decode", ex);
         }
@@ -346,42 +416,6 @@ public partial class MainWindow : Window
         {
             if (acquired) _previewDecodeSlots.Release();
         }
-    }
-
-    private static BitmapSource DecodePreview(string path, double targetWidth, double targetHeight, CancellationToken token)
-    {
-        var (width, height) = ReadImageDimensions(path, token);
-        var size = ImageDecodePolicy.Preview(width, height, targetWidth, targetHeight);
-        return DecodeBitmap(path, size, token);
-    }
-
-    private static (int Width, int Height) ReadImageDimensions(string path, CancellationToken token)
-    {
-        token.ThrowIfCancellationRequested();
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        // OnDemand avoids decoding all pixels merely to retrieve dimensions.
-        var decoder = BitmapDecoder.Create(stream,
-            BitmapCreateOptions.DelayCreation | BitmapCreateOptions.IgnoreImageCache, BitmapCacheOption.OnDemand);
-        if (decoder.Frames.Count == 0) throw new FileFormatException("画像フレームがありません");
-        var frame = decoder.Frames[0];
-        return (frame.PixelWidth, frame.PixelHeight);
-    }
-
-    private static BitmapSource DecodeBitmap(string path, DecodeDimensions size, CancellationToken token)
-    {
-        token.ThrowIfCancellationRequested();
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        var bitmap = new BitmapImage();
-        bitmap.BeginInit();
-        bitmap.CacheOption = BitmapCacheOption.OnLoad;
-        bitmap.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
-        if (size.Width > 0) bitmap.DecodePixelWidth = size.Width;
-        if (size.Height > 0) bitmap.DecodePixelHeight = size.Height;
-        bitmap.StreamSource = stream;
-        bitmap.EndInit();
-        bitmap.Freeze();
-        token.ThrowIfCancellationRequested();
-        return bitmap;
     }
 
     // 行単位の仮想化。WrapPanel直結では全500枚の要素が一度に生成されてしまう。
@@ -436,29 +470,68 @@ public partial class MainWindow : Window
         e.Handled = true;
     }
 
-    // Loadedは仮想化で画面内に現れたセルだけで発火する。最大3件まで並列デコード。
+    // Retain recent thumbnails; never evict a currently realized virtualized tile.
+    private void TouchThumbnailCache(ThumbnailItem item)
+    {
+        var node = _thumbnailCacheOrder.Find(item);
+        if (node is not null) _thumbnailCacheOrder.Remove(node);
+        _thumbnailCacheOrder.AddLast(item);
+        var examined = 0;
+        while (_thumbnailCacheOrder.Count > ThumbnailCacheLimit &&
+               examined < _thumbnailCacheOrder.Count)
+        {
+            var oldest = _thumbnailCacheOrder.First!;
+            if (oldest.Value.RealizedCount > 0)
+            {
+                _thumbnailCacheOrder.RemoveFirst();
+                _thumbnailCacheOrder.AddLast(oldest);
+                examined++;
+                continue;
+            }
+            _thumbnailCacheOrder.RemoveFirst();
+            oldest.Value.Thumbnail = null;
+            examined = 0;
+        }
+    }
+
+    private void ThumbnailImage_Unloaded(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Image { DataContext: ThumbnailItem item }) return;
+        item.RealizedCount = Math.Max(0, item.RealizedCount - 1);
+        if (item.RealizedCount == 0)
+            item.LoadCts?.Cancel();
+    }
+
+    // Only realized tiles enqueue work; offscreen requests are cancelled.
     private async void ThumbnailImage_Loaded(object sender, RoutedEventArgs e)
     {
         if (_isClosing || sender is not Image { DataContext: ThumbnailItem item }) return;
-        if (item.Thumbnail is not null || item.IsLoading) return;
-        var token = _thumbnailLoadCts.Token;
+        item.RealizedCount++;
+        if (item.Thumbnail is not null)
+        {
+            TouchThumbnailCache(item);
+            return;
+        }
+        if (item.IsLoading) return;
+        var request = CancellationTokenSource.CreateLinkedTokenSource(
+            _thumbnailLoadCts.Token, _lifetimeCts.Token);
+        item.LoadCts = request;
+        var token = request.Token;
         item.IsLoading = true;
         var acquired = false;
         try
         {
             await _thumbnailDecodeSlots.WaitAsync(token);
             acquired = true;
-            var thumbnail = await Task.Run(() => DecodeThumbnail(item.Path, token), token);
-            if (!_isClosing && !token.IsCancellationRequested)
+            var thumbnail = await ImageLoader.ThumbnailAsync(item.Path, token);
+            if (!_isClosing && !token.IsCancellationRequested && item.RealizedCount > 0)
             {
                 item.Thumbnail = thumbnail;
-                _thumbnailCacheOrder.Enqueue(item);
-                if (_thumbnailCacheOrder.Count > ThumbnailCacheLimit)
-                    _thumbnailCacheOrder.Dequeue().Thumbnail = null;
+                TouchThumbnailCache(item);
             }
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) when (IsMemoryExhaustion(ex))
+        catch (Exception ex) when (IsFatalMemoryFailure(ex))
         {
             ShutDownAfterMemoryExhaustion("Thumbnail decode", ex);
         }
@@ -471,14 +544,27 @@ public partial class MainWindow : Window
         {
             if (acquired) _thumbnailDecodeSlots.Release();
             item.IsLoading = false;
+            if (ReferenceEquals(item.LoadCts, request)) item.LoadCts = null;
+            var cancelled = token.IsCancellationRequested;
+            request.Dispose();
+            // The tile may have been realized again while an earlier request was
+            // being cancelled. The second Loaded event could not start work then.
+            if (cancelled && !_isClosing && item.RealizedCount > 0 &&
+                item.Thumbnail is null && sender is Image image &&
+                ReferenceEquals(image.DataContext, item))
+            {
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (!_isClosing && item.RealizedCount > 0 &&
+                        !item.IsLoading && item.Thumbnail is null)
+                    {
+                        // Do not count an extra Loaded; retry only the async request.
+                        item.RealizedCount--;
+                        ThumbnailImage_Loaded(image, new RoutedEventArgs());
+                    }
+                }), DispatcherPriority.Background);
+            }
         }
-    }
-
-    private static BitmapSource DecodeThumbnail(string path, CancellationToken token)
-    {
-        var (width, height) = ReadImageDimensions(path, token);
-        var size = ImageDecodePolicy.Thumbnail(width, height);
-        return DecodeBitmap(path, size, token);
     }
 
     private void UpdateControls()
@@ -511,8 +597,9 @@ public partial class MainWindow : Window
         if (hasImage)
         {
             var currentPath = _imageFiles[_currentIndex];
-            var count = GetAnnotations(currentPath).Count;
-            AnnotationCountText.Text = $"注釈 {count}件"
+            var countText = _drafts.TryGetValue(currentPath, out var annotations)
+                ? annotations.Count.ToString() : "…";
+            AnnotationCountText.Text = $"注釈 {countText}件"
                 + (_unsavedDrafts.Contains(currentPath) ? "*" : "");
         }
         else
@@ -566,6 +653,9 @@ public partial class MainWindow : Window
         if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _imageFiles.Count == 0) return;
 
         var current = _imageFiles[_currentIndex];
+        await EnsureAnnotationsLoadedAsync(current);
+        if (_isClosing || _imageFiles.Count == 0 ||
+            !string.Equals(_imageFiles[_currentIndex], current, StringComparison.OrdinalIgnoreCase)) return;
         // Alt+Enter は編集中の注釈だけをメモリ上の下書きへ反映し、画面は閉じない。
         // Ctrl+Enter のみウィンドウを閉じ、画像とJSONの保存へ進む。
         var editor = new AnnotationEditor(
@@ -587,42 +677,76 @@ public partial class MainWindow : Window
         }
     }
 
-    // 保存済みJSONを再読込することで、アプリを再起動した後も注釈を再編集できる。
-    private List<ImageAnnotation> GetAnnotations(string source)
+    // Disk I/O for annotation metadata always runs off the WPF dispatcher.
+    // The UI displays "…" until the metadata for a new image has been loaded.
+    private async Task EnsureAnnotationsLoadedAsync(string source)
     {
-        if (_drafts.TryGetValue(source, out var draft)) return draft;
-        if (_currentFolder is null) return new();
-
-        var jsonPath = Path.Combine(GetSelectedFolder(_currentFolder), Path.GetFileName(source) + ".json");
-        if (!File.Exists(jsonPath))
+        if (_isClosing || _drafts.ContainsKey(source)) return;
+        if (_metadataRequests.TryGetValue(source, out var existing))
         {
-            _drafts[source] = new();
-            return _drafts[source];
+            await existing.Task;
+            return;
         }
-
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _metadataRequests[source] = completion;
+        var folder = _currentFolder;
+        if (folder is null)
+        {
+            _metadataRequests.Remove(source);
+            completion.TrySetResult(true);
+            return;
+        }
+        var token = _thumbnailLoadCts.Token;
+        var jsonName = Path.GetFileName(source) + ".json";
         try
         {
-            if (new FileInfo(jsonPath).Length > 2 * 1024 * 1024)
-                throw new InvalidDataException("注釈JSONが上限2MBを超えています");
-            var data = JsonSerializer.Deserialize<ImageMetadata>(File.ReadAllText(jsonPath, Encoding.UTF8), JsonOptions);
-            if (data is null || data.SchemaVersion != 1 || data.ImageFile != Path.GetFileName(source))
+            if (!_metadataExists.Contains(jsonName))
             {
-                throw new JsonException("JSONの形式または画像ファイル名が一致しない");
+                _drafts[source] = new();
+                return;
             }
-            if (data.Annotations?.Any(x => x is null) == true)
-                throw new JsonException("注釈配列に null の要素があります");
-            _drafts[source] = (data.Annotations ?? new()).Select(x => x.Clone()).ToList();
+
+            var jsonPath = Path.Combine(GetSelectedFolder(folder), jsonName);
+            var data = await Task.Run(() =>
+            {
+                token.ThrowIfCancellationRequested();
+                if (new FileInfo(jsonPath).Length > 2 * 1024 * 1024)
+                    throw new InvalidDataException("注釈JSONが上限2MBを超えています");
+                var parsed = JsonSerializer.Deserialize<ImageMetadata>(
+                    File.ReadAllText(jsonPath, Encoding.UTF8), JsonOptions);
+                token.ThrowIfCancellationRequested();
+                if (parsed is null || parsed.SchemaVersion != 1 ||
+                    parsed.ImageFile != Path.GetFileName(source))
+                    throw new JsonException("JSONの形式または画像ファイル名が一致しない");
+                if (parsed.Annotations?.Any(x => x is null) == true)
+                    throw new JsonException("注釈配列に null の要素があります");
+                return (parsed.Annotations ?? new()).Select(x => x.Clone()).ToList();
+            }, token);
+            if (!_isClosing && !token.IsCancellationRequested && _currentFolder == folder)
+                _drafts[source] = data;
         }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            // 破損JSONを空データで無断上書きしない。Enterで保存する前に修正が必要。
-            CrashLogger.Write("GetAnnotations: " + jsonPath, ex);
-            ShowNotification($"注釈JSONを読めない: {ex.Message}", NotificationKind.Error);
+            if (_isClosing || token.IsCancellationRequested || _currentFolder != folder) return;
+            CrashLogger.Write("EnsureAnnotationsLoadedAsync: " + jsonName, ex);
             _drafts[source] = new();
             _invalidMetadata.Add(source);
+            ShowNotification($"注釈JSONを読めない: {ex.Message}", NotificationKind.Error);
         }
-        return _drafts[source];
+        finally
+        {
+            if (_metadataRequests.TryGetValue(source, out var active) &&
+                ReferenceEquals(active, completion)) _metadataRequests.Remove(source);
+            completion.TrySetResult(true);
+            if (!_isClosing && _currentFolder == folder && _imageFiles.Count > 0 &&
+                string.Equals(_imageFiles[_currentIndex], source, StringComparison.OrdinalIgnoreCase))
+                UpdateControls();
+        }
     }
+
+    private List<ImageAnnotation> GetAnnotations(string source) =>
+        _drafts.TryGetValue(source, out var draft) ? draft : new();
 
     private readonly HashSet<string> _invalidMetadata = new(StringComparer.OrdinalIgnoreCase);
 
@@ -631,9 +755,19 @@ public partial class MainWindow : Window
         if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _currentFolder is null || _imageFiles.Count == 0) return;
 
         var source = _imageFiles[_currentIndex];
+        _fileOperationInProgress = true;
+        UpdateControls();
+        await EnsureAnnotationsLoadedAsync(source);
+        if (_isClosing)
+        {
+            _fileOperationInProgress = false;
+            return;
+        }
         if (_invalidMetadata.Contains(source))
         {
             ShowNotification("既存JSONを読み取れないため上書きを停止。JSONを修復または退避してから再実行", NotificationKind.Error);
+            _fileOperationInProgress = false;
+            UpdateControls();
             return;
         }
 
@@ -655,38 +789,42 @@ public partial class MainWindow : Window
         var contents = JsonSerializer.Serialize(metadata, JsonOptions);
         var token = _lifetimeCts.Token;
 
-        _fileOperationInProgress = true;
-        UpdateControls();
         try
         {
-            Directory.CreateDirectory(selectedFolder);
+            await Task.Run(() => FileOps.CreateDirectory(selectedFolder), token);
 
             // 先にJSONの一時ファイルを完成させる。失敗時に画像だけ残さないため。
             tempJson = Path.Combine(selectedFolder, $".{Guid.NewGuid():N}.json.tmp");
-            await File.WriteAllTextAsync(tempJson, contents, new UTF8Encoding(false), token);
+            await Task.Run(async () =>
+                await File.WriteAllTextAsync(tempJson, contents, new UTF8Encoding(false), token), token);
 
-            if (!File.Exists(target))
+            if (!await Task.Run(() => FileOps.FileExists(target), token))
             {
                 // 画像を同じフォルダ内の一時ファイルへコピーしてから正式名へ移動。
                 tempImage = Path.Combine(selectedFolder, $".{Guid.NewGuid():N}.image.tmp");
-                await using (var input = new FileStream(
-                    source, FileMode.Open, FileAccess.Read, FileShare.Read,
-                    bufferSize: 1024 * 1024, options: FileOptions.Asynchronous | FileOptions.SequentialScan))
-                await using (var output = new FileStream(
-                    tempImage, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                    bufferSize: 1024 * 1024, options: FileOptions.Asynchronous))
+                var staged = tempImage;
+                await Task.Run(async () =>
                 {
+                    await using var input = new FileStream(
+                        source, FileMode.Open, FileAccess.Read, FileShare.Read,
+                        bufferSize: 1024 * 1024,
+                        options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+                    await using var output = new FileStream(
+                        staged, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                        bufferSize: 1024 * 1024, options: FileOptions.Asynchronous);
                     await input.CopyToAsync(output, token);
                     await output.FlushAsync(token);
-                }
-                File.Move(tempImage, target, overwrite: false);
+                }, token);
+                await Task.Run(() => FileOps.MoveFile(tempImage, target, overwrite: false), token);
                 tempImage = null;
                 createdImage = true;
             }
 
             // 既存JSONは原子リネームで更新。既存画像のバイト列は変更しない。
-            File.Move(tempJson, targetJson, overwrite: true);
+            await Task.Run(() => FileOps.MoveFile(tempJson, targetJson, overwrite: true), token);
             tempJson = null;
+            if (_isClosing) return;
+            _metadataExists.Add(fileName + ".json");
             if (createdImage) _selectedCount++;
             _thumbnailItems[_currentIndex].IsSaved = true;
             _unsavedDrafts.Remove(source);
@@ -694,166 +832,176 @@ public partial class MainWindow : Window
             NavigateAfterSelection();
             ShowNotification($"{status}: {fileName}（{metadata.Annotations.Count} 件）", NotificationKind.Success);
         }
-        catch (OperationCanceledException) when (_isClosing)
+        catch (OperationCanceledException) when (_isClosing || _forceClose)
         {
-            // Window is closing; temporary files are removed in finally.
+            if (createdImage)
+            {
+                try { await Task.Run(() => FileOps.DeleteFile(target)); }
+                catch (IOException) { /* recover on next launch */ }
+                catch (UnauthorizedAccessException) { }
+            }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {
             if (createdImage)
             {
-                try { File.Delete(target); }
-                catch (IOException) { /* ロールバックできない場合、再試行で救済する */ }
-                catch (UnauthorizedAccessException) { /* 同上 */ }
+                try { await Task.Run(() => FileOps.DeleteFile(target)); }
+                catch (IOException) { /* ロールバックできない場合は再試行 */ }
+                catch (UnauthorizedAccessException) { }
             }
-            _selectedCount = _imageFiles.Count(path =>
-                File.Exists(Path.Combine(selectedFolder, Path.GetFileName(path))));
+            _selectedCount = _thumbnailItems.Count(item => item.IsSaved);
             ShowNotification($"保存失敗（画像を進めない）: {ex.Message}", NotificationKind.Error);
         }
         finally
         {
-            foreach (var temporary in new[] { tempImage, tempJson })
+            var leftovers = new[] { tempImage, tempJson };
+            await Task.Run(() =>
             {
-                if (temporary is null) continue;
-                try { File.Delete(temporary); }
-                catch (IOException) { /* 使用中ファイルの削除不可 */ }
-                catch (UnauthorizedAccessException) { /* 削除権限なし */ }
-            }
-            _fileOperationInProgress = false;
-            if (!_isClosing) UpdateControls();
+                foreach (var temporary in leftovers)
+                {
+                    if (temporary is null) continue;
+                    try { FileOps.DeleteFile(temporary); }
+                    catch (IOException) { /* 使用中ファイルの削除不可 */ }
+                    catch (UnauthorizedAccessException) { /* 削除権限なし */ }
+                }
+            });
+            FinishFileOperation();
         }
     }
 
-    private void DeleteSelectedCopyArtifacts()
+    private async Task DeleteSelectedCopyArtifactsAsync()
     {
-        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _currentFolder is null || _imageFiles.Count == 0) return;
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress ||
+            _currentFolder is null || _imageFiles.Count == 0) return;
 
         var source = _imageFiles[_currentIndex];
         var fileName = Path.GetFileName(source);
         var selectedFolder = GetSelectedFolder(_currentFolder);
         var selectedImage = Path.Combine(selectedFolder, fileName);
         var selectedJson = selectedImage + ".json";
-        var hadImage = File.Exists(selectedImage);
-        var hadJson = File.Exists(selectedJson);
-
-        if (!hadImage && !hadJson)
+        var mightHaveImage = _thumbnailItems[_currentIndex].IsSaved;
+        var mightHaveJson = _metadataExists.Contains(fileName + ".json");
+        if (!mightHaveImage && !mightHaveJson)
         {
-            ShowNotification("この画像には削除対象の 選択済みデータがありません", NotificationKind.Information);
+            ShowNotification("この画像には選択済みデータがありません", NotificationKind.Information);
             return;
         }
 
-        var imageLabel = hadImage ? selectedImage : "なし";
-        var jsonLabel = hadJson ? selectedJson : "なし";
-        var decision = MessageBox.Show(
-            this,
-            $"選択済み保存先の選択済みデータを削除しますか？\n\n画像: {imageLabel}\nJSON: {jsonLabel}",
+        var decision = MessageBox.Show(this,
+            $"選択済み保存先の画像とJSONを削除しますか？\n\n画像: {selectedImage}\nJSON: {selectedJson}",
             "選択済みデータの削除確認",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Warning,
-            MessageBoxResult.No);
+            MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
         if (decision != MessageBoxResult.Yes) return;
 
         _fileOperationInProgress = true;
         UpdateControls();
         try
         {
-            if (hadImage) File.Delete(selectedImage);
-            if (hadJson) File.Delete(selectedJson);
-
+            var hadImage = await Task.Run(() =>
+            {
+                var imageExists = FileOps.FileExists(selectedImage);
+                if (imageExists) FileOps.DeleteFile(selectedImage);
+                if (FileOps.FileExists(selectedJson)) FileOps.DeleteFile(selectedJson);
+                return imageExists;
+            });
+            if (_isClosing) return;
             _drafts[source] = new List<ImageAnnotation>();
             _unsavedDrafts.Remove(source);
             _invalidMetadata.Remove(source);
+            _metadataExists.Remove(fileName + ".json");
             _thumbnailItems[_currentIndex].IsSaved = false;
-            _selectedCount = Math.Max(0, _selectedCount - (hadImage ? 1 : 0));
-            UpdateControls();
+            if (hadImage) _selectedCount = Math.Max(0, _selectedCount - 1);
             ShowNotification($"選択済み保存先の画像とJSONを削除: {fileName}", NotificationKind.Success);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException or ArgumentException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or
+            SecurityException or ArgumentException)
         {
-            ShowNotification($"選択済みデータの削除に失敗: {ex.Message}", NotificationKind.Error);
+            if (!_isClosing)
+                ShowNotification($"選択済みデータの削除に失敗: {ex.Message}", NotificationKind.Error);
         }
-        finally
-        {
-            _fileOperationInProgress = false;
-            UpdateControls();
-        }
+        finally { FinishFileOperation(); }
     }
 
-    // Deleteは元フォルダの画像だけをごみ箱へ移動する。
-    // selectedフォルダ内のコピー画像・サイドカーJSONは維持する。
-    private void DeleteCurrentOriginal()
+    // Recycle bin COM operations require an STA; never run them on the WPF UI thread.
+    private static Task RunOnStaThreadAsync(Action action)
     {
-        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _currentFolder is null || _imageFiles.Count == 0) return;
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try { action(); completion.TrySetResult(true); }
+            catch (Exception ex) { completion.TrySetException(ex); }
+        }) { IsBackground = true, Name = "ImageSelector.RecycleBin" };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        return completion.Task;
+    }
+
+    private async Task DeleteCurrentOriginalAsync()
+    {
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress ||
+            _currentFolder is null || _imageFiles.Count == 0) return;
 
         var source = _imageFiles[_currentIndex];
         var fileName = Path.GetFileName(source);
-        var selectedImage = Path.Combine(GetSelectedFolder(_currentFolder), fileName);
-        var hasSavedCopy = File.Exists(selectedImage);
+        var hasSavedCopy = _thumbnailItems[_currentIndex].IsSaved;
         var hasUnsavedDraft = _unsavedDrafts.Contains(source);
         var additionalWarnings = (hasSavedCopy
                 ? "\n選択済み保存先のコピー画像・注釈JSONは残します。" : "")
             + (hasUnsavedDraft
                 ? "\nこの画像の未保存注釈は破棄されます。" : "");
 
-        // Noが既定。キーリピートで削除ダイアログが連続しないようにKeyDown側でも制御。
-        var decision = MessageBox.Show(
-            this,
+        var decision = MessageBox.Show(this,
             $"元画像「{fileName}」をごみ箱へ移動しますか？\n\n元画像の場所: {source}{additionalWarnings}",
-            "元画像の削除確認",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Warning,
-            MessageBoxResult.No);
+            "元画像の削除確認", MessageBoxButton.YesNo,
+            MessageBoxImage.Warning, MessageBoxResult.No);
         if (decision != MessageBoxResult.Yes) return;
 
-        // 削除中は画像切替・保存・フォルダ変更を抑制。
         _fileOperationInProgress = true;
         UpdateControls();
         try
         {
-            if (!File.Exists(source)) throw new FileNotFoundException("元画像が見つからない", source);
-
-            // サムネイルとメイン画像の参照を解除してからWindowsのごみ箱へ移動。
             ImageDisplay.Source = null;
-            FileSystem.DeleteFile(
-                source,
-                UIOption.OnlyErrorDialogs,
-                RecycleOption.SendToRecycleBin,
-                UICancelOption.ThrowException);
-            if (File.Exists(source)) throw new IOException("元画像が残っているため、削除完了を確認できない");
-
-            // データ構造の更新は削除成功を確認してから一括実行。
+            await RunOnStaThreadAsync(() =>
+            {
+                if (!FileOps.FileExists(source))
+                    throw new FileNotFoundException("元画像が見つからない", source);
+                FileOps.DeleteToRecycleBin(source);
+                if (FileOps.FileExists(source))
+                    throw new IOException("元画像が残っているため、削除完了を確認できない");
+            });
+            if (_isClosing) return;
             var removedIndex = _currentIndex;
             _drafts.Remove(source);
             _unsavedDrafts.Remove(source);
             _invalidMetadata.Remove(source);
+            _metadataRequests.Remove(source);
             _imageFiles.RemoveAt(removedIndex);
             _thumbnailItems.RemoveAt(removedIndex);
             _currentIndex = Math.Min(removedIndex, Math.Max(0, _imageFiles.Count - 1));
             _highlightedThumbnail = null;
+            _selectedCount = _thumbnailItems.Count(item => item.IsSaved);
             RebuildThumbnailRows();
-
-            var selectedFolder = GetSelectedFolder(_currentFolder);
-            _selectedCount = _imageFiles.Count(path =>
-                File.Exists(Path.Combine(selectedFolder, Path.GetFileName(path))));
             RenderCurrentImage();
             ShowNotification($"元画像をごみ箱へ移動: {fileName}", NotificationKind.Success);
         }
         catch (OperationCanceledException)
         {
-            RenderCurrentImage();
-            ShowNotification("元画像の削除をキャンセル", NotificationKind.Information);
+            if (!_isClosing)
+            {
+                RenderCurrentImage();
+                ShowNotification("元画像の削除をキャンセル", NotificationKind.Information);
+            }
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
-            or ArgumentException or NotSupportedException or SecurityException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or
+            ArgumentException or NotSupportedException or SecurityException)
         {
-            RenderCurrentImage();
-            ShowNotification($"元画像の削除に失敗: {ex.Message}", NotificationKind.Error);
+            if (!_isClosing)
+            {
+                RenderCurrentImage();
+                ShowNotification($"元画像の削除に失敗: {ex.Message}", NotificationKind.Error);
+            }
         }
-        finally
-        {
-            _fileOperationInProgress = false;
-            UpdateControls();
-        }
+        finally { FinishFileOperation(); }
     }
 
     private void NavigateAfterSelection()
@@ -904,7 +1052,7 @@ public partial class MainWindow : Window
 
         if (key == Key.Delete && Keyboard.Modifiers == ModifierKeys.Alt)
         {
-            if (!e.IsRepeat) DeleteSelectedCopyArtifacts();
+            if (!e.IsRepeat) _ = DeleteSelectedCopyArtifactsAsync();
             e.Handled = true;
             return;
         }
@@ -942,7 +1090,7 @@ public partial class MainWindow : Window
                 e.Handled = true;
                 break;
             case Key.Delete:
-                if (!e.IsRepeat) DeleteCurrentOriginal();
+                if (!e.IsRepeat) _ = DeleteCurrentOriginalAsync();
                 e.Handled = true;
                 break;
             case Key.Return:
@@ -980,6 +1128,6 @@ public partial class MainWindow : Window
     private void NextButton_Click(object sender, RoutedEventArgs e) => Navigate(1);
     private void SelectButton_Click(object sender, RoutedEventArgs e) => _ = SelectCurrentAsync();
     private void AnnotateButton_Click(object sender, RoutedEventArgs e) => _ = OpenAnnotationEditorAsync();
-    private void DeleteButton_Click(object sender, RoutedEventArgs e) => DeleteCurrentOriginal();
-    private void DeleteSelectedCopyButton_Click(object sender, RoutedEventArgs e) => DeleteSelectedCopyArtifacts();
+    private void DeleteButton_Click(object sender, RoutedEventArgs e) => _ = DeleteCurrentOriginalAsync();
+    private void DeleteSelectedCopyButton_Click(object sender, RoutedEventArgs e) => _ = DeleteSelectedCopyArtifactsAsync();
 }

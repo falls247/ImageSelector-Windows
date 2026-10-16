@@ -38,4 +38,35 @@ Reject<InvalidDataException>(() => ImageDecodePolicy.Thumbnail(100001, 100), "re
 Reject<InvalidDataException>(() => ImageDecodePolicy.Preview(12000, 9000, 100, 100), "reject >80MP source");
 Reject<ArgumentOutOfRangeException>(() => ImageDecodePolicy.Preview(200, 100, double.NaN, 100), "reject non-finite target");
 
+ImageDecodePolicy.ValidateSource(10000, 8000, 24);
+Console.WriteLine("PASS: exactly 80MP accepted");
+Reject<InvalidDataException>(() => ImageDecodePolicy.ValidateSource(10001, 8000, 24),
+    "reject over 80MP");
+ImageDecodePolicy.ValidateSource(50000, 1, 24);
+Console.WriteLine("PASS: exactly 50,000px edge accepted");
+Check(ImageDecodePolicy.Preview(50000, 1, 1, 1).Width == 1,
+    "50000x1 fits 1x1 viewport");
+Check(ImageDecodePolicy.Preview(1, 1, 1, 1).Width == 1, "1x1 preview");
+Reject<InvalidDataException>(() => ImageDecodePolicy.ValidateSource(8500, 8500, 64),
+    "reject 64bpp over 512MiB");
+ImageDecodePolicy.ValidateSource(8000, 8000, 64);
+Console.WriteLine("PASS: 64bpp under 512MiB accepted");
+Check(MemoryFailurePolicy.Classify(new OutOfMemoryException(), 200_000_000) ==
+    MemoryFailureAction.ExitApplication, "managed OOM exits");
+foreach (var hr in new[] {
+    unchecked((int)0x8007000E),
+    unchecked((int)0x800705AF),
+    unchecked((int)0x80070008)
+})
+{
+    Check(MemoryFailurePolicy.Classify(new System.Runtime.InteropServices.COMException("WIC", hr),
+        200_000_000) == MemoryFailureAction.SkipImage,
+        $"WIC HRESULT {hr:X8} skips affected image");
+    Check(MemoryFailurePolicy.Classify(new System.Runtime.InteropServices.COMException("WIC", hr),
+        MemoryFailurePolicy.ProcessPrivateLimit) == MemoryFailureAction.ExitApplication,
+        $"WIC HRESULT {hr:X8} exits at private byte threshold");
+}
+Check(MemoryFailurePolicy.Classify(new InvalidDataException(), MemoryFailurePolicy.ProcessPrivateLimit) ==
+    MemoryFailureAction.NotMemoryFailure, "non-memory errors do not terminate process");
+
 Console.WriteLine("All decode budget checks passed.");
