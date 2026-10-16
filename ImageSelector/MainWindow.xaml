@@ -9,6 +9,7 @@
         Background="#121826" Foreground="#F1F5F9"
         InputMethod.IsInputMethodEnabled="False"
         Loaded="Window_Loaded"
+        Closed="Window_Closed"
         PreviewKeyDown="Window_PreviewKeyDown">
     <Window.Resources>
         <ui:PercentToPixelsConverter x:Key="PercentToPixelsConverter" />
