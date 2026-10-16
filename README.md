@@ -25,7 +25,7 @@ dotnet publish .\ImageSelector\ImageSelector.csproj `
   -r win-x64 `
   --self-contained true `
   -p:PublishSingleFile=true `
-  -p:EnableCompressionInSingleFile=true `
+  -p:EnableCompressionInSingleFile=false `
   -p:IncludeNativeLibrariesForSelfExtract=true `
   -o .\publish
 ```
@@ -111,6 +111,15 @@ JSON例：
   "savedAt": "2026-10-13T21:00:00+09:00"
 }
 ```
+
+## フリーズ調査・高速再起動検証
+
+Windows EXEの連続起動、画像デコード上限、再起動ストレステスト、イベントログ調査手順は [docs/rapid-relaunch-diagnostics.md](docs/rapid-relaunch-diagnostics.md) に記載。
+
+- タスクバーから連続起動しても既存ウィンドウを再利用する（2つ目のプロセスは起動を取り消す）。
+- 安全対策としてソース画像は最大80MP・長辺50,000pxまで。プレビューは最大3072px・600万画素、サムネイルは長辺256px。
+- 終了時にバックグラウンドの画像読み込み・フォルダ走査・保存をキャンセル。
+- 単一ファイル圧縮を無効化し、起動時の展開CPU負荷を削減する。EXEのサイズは増加する。
 
 ## 確認項目
 
