@@ -88,7 +88,8 @@ public static class ImageLoader
         var bitmap = new BitmapImage();
         bitmap.BeginInit();
         bitmap.CacheOption = BitmapCacheOption.OnLoad;
-        bitmap.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
+        // StreamSource has no URI: IgnoreImageCache throws ArgumentNullException in WPF.
+        bitmap.CreateOptions = BitmapCreateOptions.None;
         if (target.Width > 0) bitmap.DecodePixelWidth = target.Width;
         if (target.Height > 0) bitmap.DecodePixelHeight = target.Height;
         bitmap.StreamSource = stream;
