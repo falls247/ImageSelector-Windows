@@ -47,6 +47,8 @@ public partial class MainWindow : Window
     private bool _isClosing;
     private bool _folderPickerOpen;
     private bool _folderLoadInProgress;
+    private bool _closeRequested;
+    private bool _forceClose;
     private ThumbnailItem? _highlightedThumbnail;
     private int _thumbnailColumns = 1;
     private string? _currentFolder;
