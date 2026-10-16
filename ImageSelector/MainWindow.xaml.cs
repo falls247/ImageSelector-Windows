@@ -239,6 +239,10 @@ public partial class MainWindow : Window
                 ShowNotification("対応画像が見つからないフォルダ", NotificationKind.Information);
         }
         catch (OperationCanceledException) { }
+        catch (Exception ex) when (IsMemoryExhaustion(ex))
+        {
+            ShutDownAfterMemoryExhaustion("Folder enumeration", ex);
+        }
         catch (Exception ex)
         {
             if (_isClosing || token.IsCancellationRequested) return;
@@ -258,6 +262,15 @@ public partial class MainWindow : Window
             }
             request.Dispose();
         }
+    }
+
+    private static bool IsMemoryExhaustion(Exception exception) =>
+        exception is OutOfMemoryException || exception.HResult == unchecked((int)0x8007000E);
+
+    private static void ShutDownAfterMemoryExhaustion(string operation, Exception exception)
+    {
+        CrashLogger.Write(operation + ": fatal memory exhaustion", exception);
+        Application.Current.Shutdown(-1);
     }
 
     // 画像のデコードはバックグラウンド。フォルダを開いた後、一覧を待たずに最初の画像を要求する。
@@ -317,6 +330,10 @@ public partial class MainWindow : Window
         catch (OperationCanceledException)
         {
             // 移動先の画像だけを表示する。
+        }
+        catch (Exception ex) when (IsMemoryExhaustion(ex))
+        {
+            ShutDownAfterMemoryExhaustion("Preview decode", ex);
         }
         catch (Exception ex)
         {
@@ -441,6 +458,10 @@ public partial class MainWindow : Window
             }
         }
         catch (OperationCanceledException) { }
+        catch (Exception ex) when (IsMemoryExhaustion(ex))
+        {
+            ShutDownAfterMemoryExhaustion("Thumbnail decode", ex);
+        }
         catch (Exception ex)
         {
             if (!_isClosing && !token.IsCancellationRequested)
