@@ -208,7 +208,6 @@ public partial class MainWindow : Window
             var previousThumbnailLoad = _thumbnailLoadCts;
             previousThumbnailLoad.Cancel();
             _thumbnailLoadCts = new CancellationTokenSource();
-            previousThumbnailLoad.Dispose();
             _thumbnailCacheOrder.Clear();
             ImageDisplay.Source = null;
             _currentFolder = fullFolder;
@@ -257,7 +256,6 @@ public partial class MainWindow : Window
     {
         if (_isClosing) return;
         _previewLoadCts?.Cancel();
-        _previewLoadCts?.Dispose();
         _previewLoadCts = new CancellationTokenSource();
         var token = _previewLoadCts.Token;
 
