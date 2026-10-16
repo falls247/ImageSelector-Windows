@@ -19,7 +19,6 @@ internal static class Program
         try
         {
             var app = new App(coordinator);
-            app.InitializeComponent();
             code = app.Run();
             coordinator.MarkClosing();
             CrashLogger.TraceResources("App.Run returned");
