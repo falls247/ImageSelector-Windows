@@ -46,6 +46,7 @@ public partial class MainWindow : Window
     private readonly CancellationTokenSource _lifetimeCts = new();
     private bool _isClosing;
     private bool _folderPickerOpen;
+    private bool _folderLoadInProgress;
     private ThumbnailItem? _highlightedThumbnail;
     private int _thumbnailColumns = 1;
     private string? _currentFolder;
@@ -178,6 +179,8 @@ public partial class MainWindow : Window
         _folderLoadCts?.Cancel();
         var request = new CancellationTokenSource();
         _folderLoadCts = request;
+        _folderLoadInProgress = true;
+        UpdateControls();
         var token = request.Token;
         try
         {
@@ -246,7 +249,12 @@ public partial class MainWindow : Window
         }
         finally
         {
-            if (ReferenceEquals(_folderLoadCts, request)) _folderLoadCts = null;
+            if (ReferenceEquals(_folderLoadCts, request))
+            {
+                _folderLoadCts = null;
+                _folderLoadInProgress = false;
+                UpdateControls();
+            }
             request.Dispose();
         }
     }
@@ -402,7 +410,7 @@ public partial class MainWindow : Window
 
     private void ThumbnailTile_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        if (_isClosing || _fileOperationInProgress || sender is not FrameworkElement { DataContext: ThumbnailItem item }) return;
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || sender is not FrameworkElement { DataContext: ThumbnailItem item }) return;
         var index = _thumbnailItems.IndexOf(item);
         if (index < 0 || index == _currentIndex) return;
         _currentIndex = index;
@@ -455,17 +463,18 @@ public partial class MainWindow : Window
     {
         if (_isClosing) return;
         var hasImage = _imageFiles.Count > 0;
+        var busy = _fileOperationInProgress || _folderLoadInProgress;
         // Cached selection state: avoid redundant synchronous I/O for every keypress.
         var hasSelectedCopy = hasImage && _thumbnailItems[_currentIndex].IsSaved;
 
-        PreviousButton.IsEnabled = hasImage && !_fileOperationInProgress && _currentIndex > 0;
-        NextButton.IsEnabled = hasImage && !_fileOperationInProgress && _currentIndex < _imageFiles.Count - 1;
-        SelectButton.IsEnabled = hasImage && !_fileOperationInProgress;
-        DeleteButton.IsEnabled = hasImage && !_fileOperationInProgress;
-        DeleteSelectedCopyButton.IsEnabled = hasImage && !_fileOperationInProgress && hasSelectedCopy;
-        AnnotateButton.IsEnabled = hasImage && !_fileOperationInProgress;
+        PreviousButton.IsEnabled = hasImage && !busy && _currentIndex > 0;
+        NextButton.IsEnabled = hasImage && !busy && _currentIndex < _imageFiles.Count - 1;
+        SelectButton.IsEnabled = hasImage && !busy;
+        DeleteButton.IsEnabled = hasImage && !busy;
+        DeleteSelectedCopyButton.IsEnabled = hasImage && !busy && hasSelectedCopy;
+        AnnotateButton.IsEnabled = hasImage && !busy;
         OpenFolderButton.IsEnabled = !_fileOperationInProgress;
-        ThumbnailList.IsEnabled = hasImage && !_fileOperationInProgress;
+        ThumbnailList.IsEnabled = hasImage && !busy;
 
         PositionText.Text = hasImage ? $"{_currentIndex + 1}/{_imageFiles.Count}" : "0/0";
 
@@ -492,7 +501,7 @@ public partial class MainWindow : Window
 
     private void Navigate(int direction)
     {
-        if (_isClosing || _fileOperationInProgress || _imageFiles.Count == 0)
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _imageFiles.Count == 0)
         {
             return;
         }
@@ -511,7 +520,7 @@ public partial class MainWindow : Window
     // サイドバー幅やサムネイル倍率を変更直後の場合は、まず行レイアウトを更新する。
     private void NavigateThumbnailVertical(int rowDirection)
     {
-        if (_isClosing || _fileOperationInProgress || _imageFiles.Count == 0 ||
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _imageFiles.Count == 0 ||
             ThumbnailList.Visibility != Visibility.Visible)
             return;
 
@@ -532,7 +541,7 @@ public partial class MainWindow : Window
 
     private async Task OpenAnnotationEditorAsync()
     {
-        if (_isClosing || _fileOperationInProgress || _imageFiles.Count == 0) return;
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _imageFiles.Count == 0) return;
 
         var current = _imageFiles[_currentIndex];
         // Alt+Enter は編集中の注釈だけをメモリ上の下書きへ反映し、画面は閉じない。
@@ -597,7 +606,7 @@ public partial class MainWindow : Window
 
     private async Task SelectCurrentAsync()
     {
-        if (_fileOperationInProgress || _currentFolder is null || _imageFiles.Count == 0) return;
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _currentFolder is null || _imageFiles.Count == 0) return;
 
         var source = _imageFiles[_currentIndex];
         if (_invalidMetadata.Contains(source))
@@ -695,7 +704,7 @@ public partial class MainWindow : Window
 
     private void DeleteSelectedCopyArtifacts()
     {
-        if (_fileOperationInProgress || _currentFolder is null || _imageFiles.Count == 0) return;
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _currentFolder is null || _imageFiles.Count == 0) return;
 
         var source = _imageFiles[_currentIndex];
         var fileName = Path.GetFileName(source);
@@ -752,7 +761,7 @@ public partial class MainWindow : Window
     // selectedフォルダ内のコピー画像・サイドカーJSONは維持する。
     private void DeleteCurrentOriginal()
     {
-        if (_fileOperationInProgress || _currentFolder is null || _imageFiles.Count == 0) return;
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _currentFolder is null || _imageFiles.Count == 0) return;
 
         var source = _imageFiles[_currentIndex];
         var fileName = Path.GetFileName(source);
