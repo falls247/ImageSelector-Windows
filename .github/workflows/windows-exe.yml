@@ -30,6 +30,9 @@ jobs:
       - name: Check bounded decoding policy
         shell: pwsh
         run: dotnet run --project .\tests\DecodePolicyChecks.csproj -c Release
+      - name: Run real WIC image decode regression checks
+        shell: pwsh
+        run: dotnet run --project .\tests\DecodeIntegrationChecks.csproj -c Release
       - name: Publish self-contained EXE
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
         shell: pwsh
