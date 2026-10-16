@@ -11,6 +11,8 @@
     <ApplicationIcon>Assets\ImageSelector.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
+    <ApplicationDefinition Remove="App.xaml" />
+    <None Include="App.xaml" />
     <Resource Include="Assets\ImageSelector.ico" />
   </ItemGroup>
 </Project>
