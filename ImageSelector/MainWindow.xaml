@@ -143,7 +143,7 @@
                                                     <StackPanel Width="{Binding ElementName=ThumbSizeSlider, Path=Value, Converter={StaticResource PercentToPixelsConverter}, ConverterParameter=98}">
                                                         <Grid Height="{Binding ElementName=ThumbSizeSlider, Path=Value, Converter={StaticResource PercentToPixelsConverter}, ConverterParameter=72}"
                                                               Background="#0B1220">
-                                                            <Image Source="{Binding Thumbnail}" Loaded="ThumbnailImage_Loaded"
+                                                            <Image Source="{Binding Thumbnail}" Loaded="ThumbnailImage_Loaded" Unloaded="ThumbnailImage_Unloaded"
                                                                    Stretch="Uniform" SnapsToDevicePixels="True" />
                                                             <Border Background="#047857" CornerRadius="3"
                                                                     Padding="5,2" VerticalAlignment="Top" HorizontalAlignment="Right"
