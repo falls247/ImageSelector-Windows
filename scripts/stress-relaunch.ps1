@@ -116,14 +116,20 @@ try {
 
         # Critical regression scenario: launch immediately without waiting for old PID.
         $next = $null
-        if ($cycle -lt $Iterations -and $Mode -eq 'Overlap') { $next = Start-App }
+        $newStartUtc = $null
+        if ($cycle -lt $Iterations -and $Mode -eq 'Overlap') {
+            $next = Start-App
+            $newStartUtc = [datetime]::UtcNow
+        }
 
         if (-not $active.WaitForExit(10000)) {
             throw "Previous process failed to exit within 10 seconds: PID $oldPid"
         }
-        $oldExitUtc = [datetime]::UtcNow
-        if ($cycle -lt $Iterations -and $Mode -eq 'Sequential') { $next = Start-App }
-        $newStartUtc = if ($next) { [datetime]::UtcNow } else { $null }
+        $oldExitUtc = $active.ExitTime.ToUniversalTime()
+        if ($cycle -lt $Iterations -and $Mode -eq 'Sequential') {
+            $next = Start-App
+            $newStartUtc = [datetime]::UtcNow
+        }
         $samples.Add([pscustomobject]@{
             Cycle = $cycle
             Mode = $Mode
@@ -145,6 +151,24 @@ try {
             $cycle, $Iterations, $oldPid, $private, $previousPeak)
         $active = $next
     }
+    # Check actual process exit time versus the next instance's first LoadFolder log.
+    $logPath = Join-Path $env:LOCALAPPDATA 'ImageSelector\logs\error.log'
+    if (Test-Path -LiteralPath $logPath) {
+        $logLines = Get-Content -LiteralPath $logPath
+        foreach ($entry in $samples) {
+            if (-not $entry.NextPid) { continue }
+            $pattern = 'PID=' + $entry.NextPid + ' TID=.+ LoadFolder started:'
+            $first = $logLines | Where-Object { $_ -match $pattern } | Select-Object -Last 1
+            if (-not $first) { throw "Missing next PID LoadFolder log: $($entry.NextPid)" }
+            if ($first -notmatch '^\[([^\]]+)\]') { throw "Invalid log timestamp: $first" }
+            $loadedUtc = [datetimeoffset]::Parse($Matches[1]).UtcDateTime
+            if ($loadedUtc -le [datetime]::Parse($entry.PreviousExitUtc)) {
+                throw "New PID $($entry.NextPid) started loading before old PID $($entry.PreviousPid) exited"
+            }
+        }
+    }
+    else { throw "Missing ImageSelector PID log: $logPath" }
+
     Start-Sleep -Milliseconds 300
     $remaining = @(Get-Process ImageSelector -ErrorAction SilentlyContinue)
     if ($remaining.Count -gt 0) {
