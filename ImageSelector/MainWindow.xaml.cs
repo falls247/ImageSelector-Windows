@@ -112,8 +112,9 @@ public partial class MainWindow : Window
             return;
         }
 
-        // 初回起動時はフォルダ選択ダイアログを表示。
-        Dispatcher.BeginInvoke(new Action(() => { if (!_isClosing) ShowFolderPicker(); }), DispatcherPriority.Background);
+        // Do not automatically invoke the Shell folder picker on startup:
+        // a blocked network/WSL folder can otherwise stall the desktop immediately.
+        PlaceholderText.Text = "「フォルダを開く」または Ctrl+O で画像フォルダを選択";
     }
 
     private void ShowFolderPicker()
