@@ -64,6 +64,7 @@
                     <Grid>
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
                             <RowDefinition Height="*" />
                         </Grid.RowDefinitions>
                         <Grid Grid.Row="0" Margin="2,2,2,6">
@@ -88,8 +89,14 @@
                                        VerticalAlignment="Center" />
                         </Grid>
 
+                        <WrapPanel Grid.Row="1" Margin="2,0,2,5">
+                            <TextBlock Text="✓ 選択済み" Foreground="#6EE7B7" FontSize="10" Margin="0,0,8,2" />
+                            <TextBlock Text="✓ 注釈あり" Foreground="#93C5FD" FontSize="10" Margin="0,0,0,2"
+                                       ToolTip="反映済みの下書きを含む。未保存の注釈は件数の * で確認" />
+                        </WrapPanel>
+
                         <!-- タイルは行単位で仮想化。非表示の行は画像もUIも生成しない。 -->
-                        <ListBox x:Name="ThumbnailList" Grid.Row="1"
+                        <ListBox x:Name="ThumbnailList" Grid.Row="2"
                                  Background="Transparent" BorderThickness="0"
                                  Foreground="#F8FAFC" Focusable="False"
                                  SizeChanged="ThumbnailList_SizeChanged"
@@ -142,15 +149,30 @@
                                                     </Border.Style>
                                                     <StackPanel Width="{Binding ElementName=ThumbSizeSlider, Path=Value, Converter={StaticResource PercentToPixelsConverter}, ConverterParameter=98}">
                                                         <Grid Height="{Binding ElementName=ThumbSizeSlider, Path=Value, Converter={StaticResource PercentToPixelsConverter}, ConverterParameter=72}"
-                                                              Background="#0B1220">
+                                                              MinHeight="44" Background="#0B1220">
                                                             <Image Source="{Binding Thumbnail}" Loaded="ThumbnailImage_Loaded" Unloaded="ThumbnailImage_Unloaded"
                                                                    Stretch="Uniform" SnapsToDevicePixels="True" />
-                                                            <Border Background="#047857" CornerRadius="3"
-                                                                    Padding="5,2" VerticalAlignment="Top" HorizontalAlignment="Right"
-                                                                    Visibility="{Binding IsSaved, Converter={StaticResource BooleanToVisibilityConverter}}"
-                                                                    ToolTip="選択済みの画像">
-                                                                <TextBlock Text="✓" Foreground="White" FontSize="12" FontWeight="Bold" />
-                                                            </Border>
+                                                            <StackPanel VerticalAlignment="Top" HorizontalAlignment="Right">
+                                                                <Border Background="#047857" CornerRadius="3" Padding="5,2"
+                                                                        Visibility="{Binding IsSaved, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                                                        ToolTip="選択済みの画像">
+                                                                    <TextBlock Text="✓" Foreground="White" FontSize="12" FontWeight="Bold" />
+                                                                </Border>
+                                                                <Border Background="#1D4ED8" CornerRadius="3" Padding="5,2" Margin="0,2,0,0"
+                                                                        ToolTip="注釈あり（反映済みの下書きを含む）">
+                                                                    <Border.Style>
+                                                                        <Style TargetType="Border">
+                                                                            <Setter Property="Visibility" Value="Collapsed" />
+                                                                            <Style.Triggers>
+                                                                                <DataTrigger Binding="{Binding AnnotationStatus}" Value="{x:Static ui:AnnotationStatus.Present}">
+                                                                                    <Setter Property="Visibility" Value="Visible" />
+                                                                                </DataTrigger>
+                                                                            </Style.Triggers>
+                                                                        </Style>
+                                                                    </Border.Style>
+                                                                    <TextBlock Text="✓" Foreground="White" FontSize="12" FontWeight="Bold" />
+                                                                </Border>
+                                                            </StackPanel>
                                                         </Grid>
                                                         <TextBlock Text="{Binding FileName}" ToolTip="{Binding FileName}"
                                                                    FontSize="10" Margin="0,3,0,0"

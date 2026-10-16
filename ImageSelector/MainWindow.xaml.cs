@@ -40,6 +40,7 @@ public partial class MainWindow : Window
     private const int ThumbnailCacheLimit = 160;
     private readonly LinkedList<ThumbnailItem> _thumbnailCacheOrder = new();
     private readonly SemaphoreSlim _previewDecodeSlots = new(1, 1);
+    private readonly SemaphoreSlim _metadataReadSlots = new(3, 3);
     private CancellationTokenSource _thumbnailLoadCts = new();
     private CancellationTokenSource? _previewLoadCts;
     private CancellationTokenSource? _folderLoadCts;
@@ -287,7 +288,8 @@ public partial class MainWindow : Window
             _thumbnailItems.Clear();
             foreach (var image in images)
                 _thumbnailItems.Add(new ThumbnailItem(image,
-                    existingSelectedFiles.Contains(Path.GetFileName(image))));
+                    existingSelectedFiles.Contains(Path.GetFileName(image)),
+                    _metadataExists.Contains(Path.GetFileName(image) + ".json")));
             _selectedCount = _thumbnailItems.Count(item => item.IsSaved);
             RebuildThumbnailRows();
             FolderPathText.Text = fullFolder;
@@ -507,6 +509,7 @@ public partial class MainWindow : Window
     {
         if (_isClosing || sender is not Image { DataContext: ThumbnailItem item }) return;
         item.RealizedCount++;
+        _ = EnsureAnnotationsLoadedAsync(item.Path);
         if (item.Thumbnail is not null)
         {
             TouchThumbnailCache(item);
@@ -664,6 +667,7 @@ public partial class MainWindow : Window
             {
                 _drafts[current] = annotations.Select(a => a.Clone()).ToList();
                 _unsavedDrafts.Add(current);
+                UpdateThumbnailAnnotationStatus(current);
                 UpdateControls();
             }) { Owner = this };
 
@@ -671,6 +675,7 @@ public partial class MainWindow : Window
         {
             _drafts[current] = editor.Result.Select(a => a.Clone()).ToList();
             _unsavedDrafts.Add(current);
+            UpdateThumbnailAnnotationStatus(current);
             UpdateControls();
             if (editor.SaveAndSelectRequested)
                 await SelectCurrentAsync();
@@ -698,6 +703,7 @@ public partial class MainWindow : Window
         }
         var token = _thumbnailLoadCts.Token;
         var jsonName = Path.GetFileName(source) + ".json";
+        var acquired = false;
         try
         {
             if (!_metadataExists.Contains(jsonName))
@@ -707,6 +713,8 @@ public partial class MainWindow : Window
             }
 
             var jsonPath = Path.Combine(GetSelectedFolder(folder), jsonName);
+            await _metadataReadSlots.WaitAsync(token);
+            acquired = true;
             var data = await Task.Run(() =>
             {
                 token.ThrowIfCancellationRequested();
@@ -723,12 +731,13 @@ public partial class MainWindow : Window
                 return (parsed.Annotations ?? new()).Select(x => x.Clone()).ToList();
             }, token);
             if (!_isClosing && !token.IsCancellationRequested && _currentFolder == folder)
-                _drafts[source] = data;
+                _drafts.TryAdd(source, data);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            if (_isClosing || token.IsCancellationRequested || _currentFolder != folder) return;
+            if (_isClosing || token.IsCancellationRequested || _currentFolder != folder ||
+                _drafts.ContainsKey(source)) return;
             CrashLogger.Write("EnsureAnnotationsLoadedAsync: " + jsonName, ex);
             _drafts[source] = new();
             _invalidMetadata.Add(source);
@@ -736,13 +745,30 @@ public partial class MainWindow : Window
         }
         finally
         {
+            if (acquired) _metadataReadSlots.Release();
             if (_metadataRequests.TryGetValue(source, out var active) &&
                 ReferenceEquals(active, completion)) _metadataRequests.Remove(source);
             completion.TrySetResult(true);
-            if (!_isClosing && _currentFolder == folder && _imageFiles.Count > 0 &&
-                string.Equals(_imageFiles[_currentIndex], source, StringComparison.OrdinalIgnoreCase))
-                UpdateControls();
+            if (!_isClosing && !token.IsCancellationRequested && _currentFolder == folder)
+            {
+                UpdateThumbnailAnnotationStatus(source);
+                if (_imageFiles.Count > 0 &&
+                    string.Equals(_imageFiles[_currentIndex], source, StringComparison.OrdinalIgnoreCase))
+                    UpdateControls();
+            }
         }
+    }
+
+    private void UpdateThumbnailAnnotationStatus(string source)
+    {
+        var item = _thumbnailItems.FirstOrDefault(item =>
+            string.Equals(item.Path, source, StringComparison.OrdinalIgnoreCase));
+        if (item is null) return;
+        item.AnnotationStatus = _invalidMetadata.Contains(source)
+            ? AnnotationStatus.Invalid
+            : GetAnnotations(source).Any(annotation => !string.IsNullOrWhiteSpace(annotation.Text))
+                ? AnnotationStatus.Present
+                : AnnotationStatus.Empty;
     }
 
     private List<ImageAnnotation> GetAnnotations(string source) =>
@@ -910,6 +936,7 @@ public partial class MainWindow : Window
             _invalidMetadata.Remove(source);
             _metadataExists.Remove(fileName + ".json");
             _thumbnailItems[_currentIndex].IsSaved = false;
+            UpdateThumbnailAnnotationStatus(source);
             if (hadImage) _selectedCount = Math.Max(0, _selectedCount - 1);
             ShowNotification($"選択済み保存先の画像とJSONを削除: {fileName}", NotificationKind.Success);
         }
