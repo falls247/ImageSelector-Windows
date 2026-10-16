@@ -111,7 +111,7 @@ public partial class MainWindow : Window
     {
         // コマンドラインにフォルダが指定されていたら、そのフォルダを開く。
         var pathArgument = Environment.GetCommandLineArgs().Skip(1).FirstOrDefault();
-        if (!string.IsNullOrWhiteSpace(pathArgument) && Directory.Exists(pathArgument))
+        if (!string.IsNullOrWhiteSpace(pathArgument))
         {
             _ = LoadFolderAsync(pathArgument);
             return;
@@ -133,8 +133,7 @@ public partial class MainWindow : Window
                 Title = "画像が入っているフォルダを選択",
                 Multiselect = false
             };
-            if (_currentFolder is not null && Directory.Exists(_currentFolder))
-                dialog.InitialDirectory = _currentFolder;
+            // Do not synchronously probe a network/WSL path on the dispatcher.
 
             if (dialog.ShowDialog(this) == true && !_isClosing)
                 _ = LoadFolderAsync(dialog.FolderName);
@@ -226,17 +225,40 @@ public partial class MainWindow : Window
             // Directory enumeration and selected-copy scan can block on a slow disk/share.
             var (images, existingSelectedFiles) = await Task.Run(() =>
             {
-                var found = Directory.EnumerateFiles(fullFolder, "*", System.IO.SearchOption.TopDirectoryOnly)
-                    .Where(path => SupportedExtensions.Contains(Path.GetExtension(path)))
-                    .OrderBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
-                    .ToList();
+                var found = new List<string>();
+                var options = new EnumerationOptions { IgnoreInaccessible = true, RecurseSubdirectories = false };
+                foreach (var path in Directory.EnumerateFiles(fullFolder, "*", options))
+                {
+                    if ((found.Count & 127) == 0) token.ThrowIfCancellationRequested();
+                    if (!SupportedExtensions.Contains(Path.GetExtension(path))) continue;
+                    if (found.Count >= 20000) throw new InvalidDataException("画像の上限20,000件を超えています");
+                    found.Add(path);
+                }
+                found.Sort((left, right) => StringComparer.OrdinalIgnoreCase.Compare(
+                    Path.GetFileName(left), Path.GetFileName(right)));
                 token.ThrowIfCancellationRequested();
                 var selectedFolder = GetSelectedFolder(fullFolder);
-                var selected = Directory.Exists(selectedFolder)
-                    ? Directory.EnumerateFiles(selectedFolder, "*", System.IO.SearchOption.TopDirectoryOnly)
-                        .Select(path => Path.GetFileName(path) ?? string.Empty)
-                        .ToHashSet(StringComparer.OrdinalIgnoreCase)
-                    : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var selected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (Directory.Exists(selectedFolder))
+                {
+                    var scanned = 0;
+                    foreach (var path in Directory.EnumerateFiles(selectedFolder, "*", options))
+                    {
+                        if ((scanned++ & 127) == 0) token.ThrowIfCancellationRequested();
+                        var name = Path.GetFileName(path);
+                        if (System.Text.RegularExpressions.Regex.IsMatch(name,
+                            @"^\.[0-9a-f]{32}\.(image|json)\.tmp$", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                        {
+                            if (File.GetLastWriteTimeUtc(path) < DateTime.UtcNow.AddHours(-24))
+                            {
+                                try { File.Delete(path); }
+                                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+                            }
+                            continue;
+                        }
+                        selected.Add(name);
+                    }
+                }
                 token.ThrowIfCancellationRequested();
                 return (found, selected);
             }, token);
