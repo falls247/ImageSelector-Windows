@@ -783,136 +783,140 @@ public partial class MainWindow : Window
         }
     }
 
-    private void DeleteSelectedCopyArtifacts()
+    private async Task DeleteSelectedCopyArtifactsAsync()
     {
-        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _currentFolder is null || _imageFiles.Count == 0) return;
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress ||
+            _currentFolder is null || _imageFiles.Count == 0) return;
 
         var source = _imageFiles[_currentIndex];
         var fileName = Path.GetFileName(source);
         var selectedFolder = GetSelectedFolder(_currentFolder);
         var selectedImage = Path.Combine(selectedFolder, fileName);
         var selectedJson = selectedImage + ".json";
-        var hadImage = File.Exists(selectedImage);
-        var hadJson = File.Exists(selectedJson);
-
-        if (!hadImage && !hadJson)
+        var mightHaveImage = _thumbnailItems[_currentIndex].IsSaved;
+        var mightHaveJson = _metadataExists.Contains(fileName + ".json");
+        if (!mightHaveImage && !mightHaveJson)
         {
-            ShowNotification("この画像には削除対象の 選択済みデータがありません", NotificationKind.Information);
+            ShowNotification("この画像には選択済みデータがありません", NotificationKind.Information);
             return;
         }
 
-        var imageLabel = hadImage ? selectedImage : "なし";
-        var jsonLabel = hadJson ? selectedJson : "なし";
-        var decision = MessageBox.Show(
-            this,
-            $"選択済み保存先の選択済みデータを削除しますか？\n\n画像: {imageLabel}\nJSON: {jsonLabel}",
+        var decision = MessageBox.Show(this,
+            $"選択済み保存先の画像とJSONを削除しますか？\n\n画像: {selectedImage}\nJSON: {selectedJson}",
             "選択済みデータの削除確認",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Warning,
-            MessageBoxResult.No);
+            MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
         if (decision != MessageBoxResult.Yes) return;
 
         _fileOperationInProgress = true;
         UpdateControls();
         try
         {
-            if (hadImage) File.Delete(selectedImage);
-            if (hadJson) File.Delete(selectedJson);
-
+            var hadImage = await Task.Run(() =>
+            {
+                var imageExists = File.Exists(selectedImage);
+                if (imageExists) File.Delete(selectedImage);
+                if (File.Exists(selectedJson)) File.Delete(selectedJson);
+                return imageExists;
+            });
+            if (_isClosing) return;
             _drafts[source] = new List<ImageAnnotation>();
             _unsavedDrafts.Remove(source);
             _invalidMetadata.Remove(source);
+            _metadataExists.Remove(fileName + ".json");
             _thumbnailItems[_currentIndex].IsSaved = false;
-            _selectedCount = Math.Max(0, _selectedCount - (hadImage ? 1 : 0));
-            UpdateControls();
+            if (hadImage) _selectedCount = Math.Max(0, _selectedCount - 1);
             ShowNotification($"選択済み保存先の画像とJSONを削除: {fileName}", NotificationKind.Success);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException or ArgumentException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or
+            SecurityException or ArgumentException)
         {
-            ShowNotification($"選択済みデータの削除に失敗: {ex.Message}", NotificationKind.Error);
+            if (!_isClosing)
+                ShowNotification($"選択済みデータの削除に失敗: {ex.Message}", NotificationKind.Error);
         }
-        finally
-        {
-            _fileOperationInProgress = false;
-            UpdateControls();
-        }
+        finally { FinishFileOperation(); }
     }
 
-    // Deleteは元フォルダの画像だけをごみ箱へ移動する。
-    // selectedフォルダ内のコピー画像・サイドカーJSONは維持する。
-    private void DeleteCurrentOriginal()
+    // Recycle bin COM operations require an STA; never run them on the WPF UI thread.
+    private static Task RunOnStaThreadAsync(Action action)
     {
-        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _currentFolder is null || _imageFiles.Count == 0) return;
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try { action(); completion.TrySetResult(true); }
+            catch (Exception ex) { completion.TrySetException(ex); }
+        }) { IsBackground = true, Name = "ImageSelector.RecycleBin" };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        return completion.Task;
+    }
+
+    private async Task DeleteCurrentOriginalAsync()
+    {
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress ||
+            _currentFolder is null || _imageFiles.Count == 0) return;
 
         var source = _imageFiles[_currentIndex];
         var fileName = Path.GetFileName(source);
-        var selectedImage = Path.Combine(GetSelectedFolder(_currentFolder), fileName);
-        var hasSavedCopy = File.Exists(selectedImage);
+        var hasSavedCopy = _thumbnailItems[_currentIndex].IsSaved;
         var hasUnsavedDraft = _unsavedDrafts.Contains(source);
         var additionalWarnings = (hasSavedCopy
                 ? "\n選択済み保存先のコピー画像・注釈JSONは残します。" : "")
             + (hasUnsavedDraft
                 ? "\nこの画像の未保存注釈は破棄されます。" : "");
 
-        // Noが既定。キーリピートで削除ダイアログが連続しないようにKeyDown側でも制御。
-        var decision = MessageBox.Show(
-            this,
+        var decision = MessageBox.Show(this,
             $"元画像「{fileName}」をごみ箱へ移動しますか？\n\n元画像の場所: {source}{additionalWarnings}",
-            "元画像の削除確認",
-            MessageBoxButton.YesNo,
-            MessageBoxImage.Warning,
-            MessageBoxResult.No);
+            "元画像の削除確認", MessageBoxButton.YesNo,
+            MessageBoxImage.Warning, MessageBoxResult.No);
         if (decision != MessageBoxResult.Yes) return;
 
-        // 削除中は画像切替・保存・フォルダ変更を抑制。
         _fileOperationInProgress = true;
         UpdateControls();
         try
         {
-            if (!File.Exists(source)) throw new FileNotFoundException("元画像が見つからない", source);
-
-            // サムネイルとメイン画像の参照を解除してからWindowsのごみ箱へ移動。
             ImageDisplay.Source = null;
-            FileSystem.DeleteFile(
-                source,
-                UIOption.OnlyErrorDialogs,
-                RecycleOption.SendToRecycleBin,
-                UICancelOption.ThrowException);
-            if (File.Exists(source)) throw new IOException("元画像が残っているため、削除完了を確認できない");
-
-            // データ構造の更新は削除成功を確認してから一括実行。
+            await RunOnStaThreadAsync(() =>
+            {
+                if (!File.Exists(source))
+                    throw new FileNotFoundException("元画像が見つからない", source);
+                FileSystem.DeleteFile(source, UIOption.OnlyErrorDialogs,
+                    RecycleOption.SendToRecycleBin, UICancelOption.ThrowException);
+                if (File.Exists(source))
+                    throw new IOException("元画像が残っているため、削除完了を確認できない");
+            });
+            if (_isClosing) return;
             var removedIndex = _currentIndex;
             _drafts.Remove(source);
             _unsavedDrafts.Remove(source);
             _invalidMetadata.Remove(source);
+            _metadataRequests.Remove(source);
             _imageFiles.RemoveAt(removedIndex);
             _thumbnailItems.RemoveAt(removedIndex);
             _currentIndex = Math.Min(removedIndex, Math.Max(0, _imageFiles.Count - 1));
             _highlightedThumbnail = null;
+            _selectedCount = _thumbnailItems.Count(item => item.IsSaved);
             RebuildThumbnailRows();
-
-            var selectedFolder = GetSelectedFolder(_currentFolder);
-            _selectedCount = _imageFiles.Count(path =>
-                File.Exists(Path.Combine(selectedFolder, Path.GetFileName(path))));
             RenderCurrentImage();
             ShowNotification($"元画像をごみ箱へ移動: {fileName}", NotificationKind.Success);
         }
         catch (OperationCanceledException)
         {
-            RenderCurrentImage();
-            ShowNotification("元画像の削除をキャンセル", NotificationKind.Information);
+            if (!_isClosing)
+            {
+                RenderCurrentImage();
+                ShowNotification("元画像の削除をキャンセル", NotificationKind.Information);
+            }
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
-            or ArgumentException or NotSupportedException or SecurityException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or
+            ArgumentException or NotSupportedException or SecurityException)
         {
-            RenderCurrentImage();
-            ShowNotification($"元画像の削除に失敗: {ex.Message}", NotificationKind.Error);
+            if (!_isClosing)
+            {
+                RenderCurrentImage();
+                ShowNotification($"元画像の削除に失敗: {ex.Message}", NotificationKind.Error);
+            }
         }
-        finally
-        {
-            _fileOperationInProgress = false;
-            UpdateControls();
-        }
+        finally { FinishFileOperation(); }
     }
 
     private void NavigateAfterSelection()
@@ -963,7 +967,7 @@ public partial class MainWindow : Window
 
         if (key == Key.Delete && Keyboard.Modifiers == ModifierKeys.Alt)
         {
-            if (!e.IsRepeat) DeleteSelectedCopyArtifacts();
+            if (!e.IsRepeat) _ = DeleteSelectedCopyArtifactsAsync();
             e.Handled = true;
             return;
         }
@@ -1001,7 +1005,7 @@ public partial class MainWindow : Window
                 e.Handled = true;
                 break;
             case Key.Delete:
-                if (!e.IsRepeat) DeleteCurrentOriginal();
+                if (!e.IsRepeat) _ = DeleteCurrentOriginalAsync();
                 e.Handled = true;
                 break;
             case Key.Return:
@@ -1039,6 +1043,6 @@ public partial class MainWindow : Window
     private void NextButton_Click(object sender, RoutedEventArgs e) => Navigate(1);
     private void SelectButton_Click(object sender, RoutedEventArgs e) => _ = SelectCurrentAsync();
     private void AnnotateButton_Click(object sender, RoutedEventArgs e) => _ = OpenAnnotationEditorAsync();
-    private void DeleteButton_Click(object sender, RoutedEventArgs e) => DeleteCurrentOriginal();
-    private void DeleteSelectedCopyButton_Click(object sender, RoutedEventArgs e) => DeleteSelectedCopyArtifacts();
+    private void DeleteButton_Click(object sender, RoutedEventArgs e) => _ = DeleteCurrentOriginalAsync();
+    private void DeleteSelectedCopyButton_Click(object sender, RoutedEventArgs e) => _ = DeleteSelectedCopyArtifactsAsync();
 }
