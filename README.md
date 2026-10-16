@@ -34,7 +34,7 @@ dotnet publish .\ImageSelector\ImageSelector.csproj `
 
 ### GitHub Actionsから取得
 
-GitHubの `Actions` → `Build Windows EXE` → `Run workflow` で発行を開始する。完了後、実行結果ページのArtifactsから `ImageSelector-win-x64` をダウンロードして展開する。push / pull request時はコンパイル確認のみ実行する。
+GitHubの `Actions` → `Build Windows EXE` → `Run workflow` で発行を開始する。完了後、実行結果ページのArtifactsから `ImageSelector-win-x64` をダウンロードして展開する。push時はビルド・デコード上限テスト、pull request時はさらに配布用EXEを生成してArtifactsにアップロードする。
 
 ## 操作
 
