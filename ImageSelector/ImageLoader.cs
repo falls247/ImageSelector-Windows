@@ -1,0 +1,100 @@
+using System.IO;
+using System.Windows.Media.Imaging;
+
+namespace ImageSelector;
+
+/// <summary>
+/// File-backed decoding always occurs on background workers. WIC must never use an
+/// uncapped source or hold a remote file open after the completed bitmap is frozen.
+/// </summary>
+public static class ImageLoader
+{
+    public const long MaxFileBytes = 256L * 1024 * 1024;
+    private const int CopyBufferSize = 128 * 1024;
+
+    public static Task<BitmapSource> PreviewAsync(
+        string path, double width, double height, CancellationToken token) =>
+        LoadAsync(path, width, height, false, token);
+
+    public static Task<BitmapSource> ThumbnailAsync(string path, CancellationToken token) =>
+        LoadAsync(path, 256, 256, true, token);
+
+    private static async Task<BitmapSource> LoadAsync(
+        string path, double width, double height, bool thumbnail, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        // FileInfo and DriveInfo are on a background worker to keep UI responsive.
+        var remote = await Task.Run(() => PathKind.IsRemote(path), token).ConfigureAwait(false);
+        if (!remote)
+            return await Task.Run(() => DecodeLocal(path, width, height, thumbnail, token), token).ConfigureAwait(false);
+
+        // Move network I/O outside WIC so a blocked native decoder cannot hold remote
+        // UNC/WSL handles; file bytes have a strict limit and cancellable copy.
+        await using var file = new FileStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete, CopyBufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        CheckFileLength(file.Length);
+        using var memory = new MemoryStream((int)file.Length);
+        var buffer = new byte[CopyBufferSize];
+        int read;
+        while ((read = await file.ReadAsync(buffer, token).ConfigureAwait(false)) > 0)
+        {
+            token.ThrowIfCancellationRequested();
+            if (memory.Length + read > MaxFileBytes)
+                throw new InvalidDataException("画像ファイルが256MBの上限を超えています");
+            memory.Write(buffer, 0, read);
+        }
+        memory.Position = 0;
+        return await Task.Run(() => DecodeStream(memory, width, height, thumbnail, token), token).ConfigureAwait(false);
+    }
+
+    private static BitmapSource DecodeLocal(
+        string path, double width, double height, bool thumbnail, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete, CopyBufferSize, FileOptions.SequentialScan);
+        CheckFileLength(stream.Length);
+        return DecodeStream(stream, width, height, thumbnail, token);
+    }
+
+    private static void CheckFileLength(long length)
+    {
+        if (length > MaxFileBytes)
+            throw new InvalidDataException("画像ファイルが256MBの上限を超えています");
+        if (length <= 0)
+            throw new InvalidDataException("画像ファイルが空です");
+    }
+
+    private static BitmapSource DecodeStream(
+        Stream stream, double width, double height, bool thumbnail, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        // Keep the metadata decoder in the same worker and on the same open stream.
+        // Do not use DelayCreation: it can defer metadata reads until after disposal.
+        var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.None, BitmapCacheOption.OnDemand);
+        if (decoder.Frames.Count == 0) throw new FileFormatException("画像フレームがありません");
+        var frame = decoder.Frames[0];
+        var sourceWidth = frame.PixelWidth;
+        var sourceHeight = frame.PixelHeight;
+        var bitsPerPixel = frame.Format.BitsPerPixel;
+        ImageDecodePolicy.ValidateSource(sourceWidth, sourceHeight, bitsPerPixel);
+
+        var target = thumbnail
+            ? ImageDecodePolicy.Thumbnail(sourceWidth, sourceHeight)
+            : ImageDecodePolicy.Preview(sourceWidth, sourceHeight, width, height);
+
+        token.ThrowIfCancellationRequested();
+        stream.Seek(0, SeekOrigin.Begin);
+        var bitmap = new BitmapImage();
+        bitmap.BeginInit();
+        bitmap.CacheOption = BitmapCacheOption.OnLoad;
+        bitmap.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
+        if (target.Width > 0) bitmap.DecodePixelWidth = target.Width;
+        if (target.Height > 0) bitmap.DecodePixelHeight = target.Height;
+        bitmap.StreamSource = stream;
+        bitmap.EndInit();
+        bitmap.Freeze();
+        token.ThrowIfCancellationRequested();
+        return bitmap;
+    }
+}
