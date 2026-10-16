@@ -54,6 +54,7 @@ public partial class App : Application
             return;
         }
 
+        CrashLogger.TraceResources("Startup acquired instance mutex");
         _activationEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ActivationName);
         _exitEvent = new EventWaitHandle(false, EventResetMode.ManualReset);
         var activation = _activationEvent;
