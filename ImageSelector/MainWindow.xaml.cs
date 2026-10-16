@@ -38,7 +38,7 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _thumbnailLayoutTimer = new();
     private readonly SemaphoreSlim _thumbnailDecodeSlots = new(1, 1);
     private const int ThumbnailCacheLimit = 160;
-    private readonly Queue<ThumbnailItem> _thumbnailCacheOrder = new();
+    private readonly LinkedList<ThumbnailItem> _thumbnailCacheOrder = new();
     private readonly SemaphoreSlim _previewDecodeSlots = new(1, 1);
     private CancellationTokenSource _thumbnailLoadCts = new();
     private CancellationTokenSource? _previewLoadCts;
@@ -470,12 +470,53 @@ public partial class MainWindow : Window
         e.Handled = true;
     }
 
-    // 仮想化セルのサムネイルを1件ずつデコードする。
+    // Retain recent thumbnails; never evict a currently realized virtualized tile.
+    private void TouchThumbnailCache(ThumbnailItem item)
+    {
+        var node = _thumbnailCacheOrder.Find(item);
+        if (node is not null) _thumbnailCacheOrder.Remove(node);
+        _thumbnailCacheOrder.AddLast(item);
+        var examined = 0;
+        while (_thumbnailCacheOrder.Count > ThumbnailCacheLimit &&
+               examined < _thumbnailCacheOrder.Count)
+        {
+            var oldest = _thumbnailCacheOrder.First!;
+            if (oldest.Value.RealizedCount > 0)
+            {
+                _thumbnailCacheOrder.RemoveFirst();
+                _thumbnailCacheOrder.AddLast(oldest);
+                examined++;
+                continue;
+            }
+            _thumbnailCacheOrder.RemoveFirst();
+            oldest.Value.Thumbnail = null;
+            examined = 0;
+        }
+    }
+
+    private void ThumbnailImage_Unloaded(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Image { DataContext: ThumbnailItem item }) return;
+        item.RealizedCount = Math.Max(0, item.RealizedCount - 1);
+        if (item.RealizedCount == 0)
+            item.LoadCts?.Cancel();
+    }
+
+    // Only realized tiles enqueue work; offscreen requests are cancelled.
     private async void ThumbnailImage_Loaded(object sender, RoutedEventArgs e)
     {
         if (_isClosing || sender is not Image { DataContext: ThumbnailItem item }) return;
-        if (item.Thumbnail is not null || item.IsLoading) return;
-        var token = _thumbnailLoadCts.Token;
+        item.RealizedCount++;
+        if (item.Thumbnail is not null)
+        {
+            TouchThumbnailCache(item);
+            return;
+        }
+        if (item.IsLoading) return;
+        var request = CancellationTokenSource.CreateLinkedTokenSource(
+            _thumbnailLoadCts.Token, _lifetimeCts.Token);
+        item.LoadCts = request;
+        var token = request.Token;
         item.IsLoading = true;
         var acquired = false;
         try
@@ -483,12 +524,10 @@ public partial class MainWindow : Window
             await _thumbnailDecodeSlots.WaitAsync(token);
             acquired = true;
             var thumbnail = await ImageLoader.ThumbnailAsync(item.Path, token);
-            if (!_isClosing && !token.IsCancellationRequested)
+            if (!_isClosing && !token.IsCancellationRequested && item.RealizedCount > 0)
             {
                 item.Thumbnail = thumbnail;
-                _thumbnailCacheOrder.Enqueue(item);
-                if (_thumbnailCacheOrder.Count > ThumbnailCacheLimit)
-                    _thumbnailCacheOrder.Dequeue().Thumbnail = null;
+                TouchThumbnailCache(item);
             }
         }
         catch (OperationCanceledException) { }
@@ -505,6 +544,26 @@ public partial class MainWindow : Window
         {
             if (acquired) _thumbnailDecodeSlots.Release();
             item.IsLoading = false;
+            if (ReferenceEquals(item.LoadCts, request)) item.LoadCts = null;
+            var cancelled = token.IsCancellationRequested;
+            request.Dispose();
+            // The tile may have been realized again while an earlier request was
+            // being cancelled. The second Loaded event could not start work then.
+            if (cancelled && !_isClosing && item.RealizedCount > 0 &&
+                item.Thumbnail is null && sender is Image image &&
+                ReferenceEquals(image.DataContext, item))
+            {
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (!_isClosing && item.RealizedCount > 0 &&
+                        !item.IsLoading && item.Thumbnail is null)
+                    {
+                        // Do not count an extra Loaded; retry only the async request.
+                        item.RealizedCount--;
+                        ThumbnailImage_Loaded(image, new RoutedEventArgs());
+                    }
+                }), DispatcherPriority.Background);
+            }
         }
     }
 
