@@ -239,7 +239,7 @@ public partial class MainWindow : Window
                 ShowNotification("対応画像が見つからないフォルダ", NotificationKind.Information);
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) when (IsMemoryExhaustion(ex))
+        catch (Exception ex) when (IsFatalMemoryFailure(ex))
         {
             ShutDownAfterMemoryExhaustion("Folder enumeration", ex);
         }
@@ -264,12 +264,19 @@ public partial class MainWindow : Window
         }
     }
 
-    private static bool IsMemoryExhaustion(Exception exception) =>
-        exception is OutOfMemoryException || exception.HResult == unchecked((int)0x8007000E);
+    private static bool IsFatalMemoryFailure(Exception exception)
+    {
+        using var p = System.Diagnostics.Process.GetCurrentProcess();
+        return MemoryFailurePolicy.Classify(exception, p.PrivateMemorySize64) ==
+            MemoryFailureAction.ExitApplication;
+    }
 
     private static void ShutDownAfterMemoryExhaustion(string operation, Exception exception)
     {
         CrashLogger.Write(operation + ": fatal memory exhaustion", exception);
+        MessageBox.Show(
+            "メモリ不足のため安全に終了します。\n詳細ログ: " + CrashLogger.LogPath,
+            "Image Selector - メモリ不足", MessageBoxButton.OK, MessageBoxImage.Error);
         Application.Current.Shutdown(-1);
     }
 
@@ -320,7 +327,7 @@ public partial class MainWindow : Window
         {
             await _previewDecodeSlots.WaitAsync(token);
             acquired = true;
-            var bitmap = await Task.Run(() => DecodePreview(path, targetWidth, targetHeight, token), token);
+            var bitmap = await ImageLoader.PreviewAsync(path, targetWidth, targetHeight, token);
             if (_isClosing || token.IsCancellationRequested || _imageFiles.Count == 0 ||
                 !string.Equals(_imageFiles[_currentIndex], path, StringComparison.OrdinalIgnoreCase)) return;
 
@@ -331,7 +338,7 @@ public partial class MainWindow : Window
         {
             // 移動先の画像だけを表示する。
         }
-        catch (Exception ex) when (IsMemoryExhaustion(ex))
+        catch (Exception ex) when (IsFatalMemoryFailure(ex))
         {
             ShutDownAfterMemoryExhaustion("Preview decode", ex);
         }
@@ -346,42 +353,6 @@ public partial class MainWindow : Window
         {
             if (acquired) _previewDecodeSlots.Release();
         }
-    }
-
-    private static BitmapSource DecodePreview(string path, double targetWidth, double targetHeight, CancellationToken token)
-    {
-        var (width, height) = ReadImageDimensions(path, token);
-        var size = ImageDecodePolicy.Preview(width, height, targetWidth, targetHeight);
-        return DecodeBitmap(path, size, token);
-    }
-
-    private static (int Width, int Height) ReadImageDimensions(string path, CancellationToken token)
-    {
-        token.ThrowIfCancellationRequested();
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        // OnDemand avoids decoding all pixels merely to retrieve dimensions.
-        var decoder = BitmapDecoder.Create(stream,
-            BitmapCreateOptions.DelayCreation | BitmapCreateOptions.IgnoreImageCache, BitmapCacheOption.OnDemand);
-        if (decoder.Frames.Count == 0) throw new FileFormatException("画像フレームがありません");
-        var frame = decoder.Frames[0];
-        return (frame.PixelWidth, frame.PixelHeight);
-    }
-
-    private static BitmapSource DecodeBitmap(string path, DecodeDimensions size, CancellationToken token)
-    {
-        token.ThrowIfCancellationRequested();
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        var bitmap = new BitmapImage();
-        bitmap.BeginInit();
-        bitmap.CacheOption = BitmapCacheOption.OnLoad;
-        bitmap.CreateOptions = BitmapCreateOptions.IgnoreImageCache;
-        if (size.Width > 0) bitmap.DecodePixelWidth = size.Width;
-        if (size.Height > 0) bitmap.DecodePixelHeight = size.Height;
-        bitmap.StreamSource = stream;
-        bitmap.EndInit();
-        bitmap.Freeze();
-        token.ThrowIfCancellationRequested();
-        return bitmap;
     }
 
     // 行単位の仮想化。WrapPanel直結では全500枚の要素が一度に生成されてしまう。
@@ -436,7 +407,7 @@ public partial class MainWindow : Window
         e.Handled = true;
     }
 
-    // Loadedは仮想化で画面内に現れたセルだけで発火する。最大3件まで並列デコード。
+    // 仮想化セルのサムネイルを1件ずつデコードする。
     private async void ThumbnailImage_Loaded(object sender, RoutedEventArgs e)
     {
         if (_isClosing || sender is not Image { DataContext: ThumbnailItem item }) return;
@@ -448,7 +419,7 @@ public partial class MainWindow : Window
         {
             await _thumbnailDecodeSlots.WaitAsync(token);
             acquired = true;
-            var thumbnail = await Task.Run(() => DecodeThumbnail(item.Path, token), token);
+            var thumbnail = await ImageLoader.ThumbnailAsync(item.Path, token);
             if (!_isClosing && !token.IsCancellationRequested)
             {
                 item.Thumbnail = thumbnail;
@@ -458,7 +429,7 @@ public partial class MainWindow : Window
             }
         }
         catch (OperationCanceledException) { }
-        catch (Exception ex) when (IsMemoryExhaustion(ex))
+        catch (Exception ex) when (IsFatalMemoryFailure(ex))
         {
             ShutDownAfterMemoryExhaustion("Thumbnail decode", ex);
         }
@@ -472,13 +443,6 @@ public partial class MainWindow : Window
             if (acquired) _thumbnailDecodeSlots.Release();
             item.IsLoading = false;
         }
-    }
-
-    private static BitmapSource DecodeThumbnail(string path, CancellationToken token)
-    {
-        var (width, height) = ReadImageDimensions(path, token);
-        var size = ImageDecodePolicy.Thumbnail(width, height);
-        return DecodeBitmap(path, size, token);
     }
 
     private void UpdateControls()
