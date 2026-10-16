@@ -64,6 +64,7 @@ public partial class MainWindow : Window
 
     public MainWindow()
     {
+        CrashLogger.Trace("MainWindow constructed");
         InitializeComponent();
         ThumbnailList.ItemsSource = _thumbnailRows;
 
