@@ -186,14 +186,14 @@ public partial class MainWindow : Window
             // Directory enumeration and selected-copy scan can block on a slow disk/share.
             var (images, existingSelectedFiles) = await Task.Run(() =>
             {
-                var found = Directory.EnumerateFiles(fullFolder, "*", SearchOption.TopDirectoryOnly)
+                var found = Directory.EnumerateFiles(fullFolder, "*", System.IO.SearchOption.TopDirectoryOnly)
                     .Where(path => SupportedExtensions.Contains(Path.GetExtension(path)))
                     .OrderBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)
                     .ToList();
                 token.ThrowIfCancellationRequested();
                 var selectedFolder = GetSelectedFolder(fullFolder);
                 var selected = Directory.Exists(selectedFolder)
-                    ? Directory.EnumerateFiles(selectedFolder, "*", SearchOption.TopDirectoryOnly)
+                    ? Directory.EnumerateFiles(selectedFolder, "*", System.IO.SearchOption.TopDirectoryOnly)
                         .Select(path => Path.GetFileName(path) ?? string.Empty)
                         .ToHashSet(StringComparer.OrdinalIgnoreCase)
                     : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
