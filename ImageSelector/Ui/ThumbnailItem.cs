@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Threading;
 using System.Windows.Media;
 
 namespace ImageSelector.Ui;
@@ -32,6 +33,8 @@ public sealed class ThumbnailItem : INotifyPropertyChanged
     }
 
     public bool IsLoading { get; set; }
+    public int RealizedCount { get; set; }
+    public CancellationTokenSource? LoadCts { get; set; }
 
     public bool IsCurrent
     {
