@@ -7,6 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>ImageSelector</AssemblyName>
     <RootNamespace>ImageSelector</RootNamespace>
+    <StartupObject>ImageSelector.Program</StartupObject>
     <ApplicationIcon>Assets\ImageSelector.ico</ApplicationIcon>
   </PropertyGroup>
   <ItemGroup>
