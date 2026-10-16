@@ -27,7 +27,7 @@ try {
     } finally { $tall.Dispose() }
 
     for ($i = 1; $i -le $Iterations; $i++) {
-        $active = Start-Process -FilePath $exe -ArgumentList @($dir) -PassThru
+        $active = Start-Process -FilePath $exe -ArgumentList ('"{0}"' -f $dir) -PassThru
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
         do {
             Start-Sleep -Milliseconds 200
@@ -51,7 +51,7 @@ try {
         if ($private -gt $MaxPrivateMB) { throw "Private memory $private MB exceeds limit $MaxPrivateMB MB" }
 
         # A second EXE must exit without creating another UI/decoder.
-        $duplicate = Start-Process -FilePath $exe -ArgumentList @($dir) -PassThru
+        $duplicate = Start-Process -FilePath $exe -ArgumentList ('"{0}"' -f $dir) -PassThru
         if (-not $duplicate.WaitForExit(6000)) {
             $duplicate.Kill()
             throw "Concurrent launch failed to exit in cycle $i."
