@@ -145,6 +145,36 @@ public partial class MainWindow : Window
         }
     }
 
+    private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
+    {
+        if (_fileOperationInProgress && !_forceClose)
+        {
+            e.Cancel = true;
+            if (_closeRequested) return;
+            _closeRequested = true;
+            ShowNotification("保存・削除処理が完了したら終了します", NotificationKind.Information);
+            var delay = new DispatcherTimer { Interval = TimeSpan.FromSeconds(10) };
+            delay.Tick += (_, _) =>
+            {
+                delay.Stop();
+                if (!_fileOperationInProgress || _isClosing) return;
+                CrashLogger.Trace("Close request timeout: cancelling ongoing file operation");
+                _lifetimeCts.Cancel();
+                _forceClose = true;
+                Close();
+            };
+            delay.Start();
+        }
+    }
+
+    private void FinishFileOperation()
+    {
+        _fileOperationInProgress = false;
+        if (!_isClosing) UpdateControls();
+        if (_closeRequested && !_isClosing)
+            Dispatcher.BeginInvoke(new Action(Close), DispatcherPriority.Background);
+    }
+
     // Do not wait for decoders or directory enumeration on the dispatcher during exit.
     private void Window_Closed(object sender, EventArgs e)
     {
@@ -707,6 +737,8 @@ public partial class MainWindow : Window
             // 既存JSONは原子リネームで更新。既存画像のバイト列は変更しない。
             await Task.Run(() => File.Move(tempJson, targetJson, overwrite: true), token);
             tempJson = null;
+            if (_isClosing) return;
+            _metadataExists.Add(fileName + ".json");
             if (createdImage) _selectedCount++;
             _thumbnailItems[_currentIndex].IsSaved = true;
             _unsavedDrafts.Remove(source);
@@ -714,17 +746,22 @@ public partial class MainWindow : Window
             NavigateAfterSelection();
             ShowNotification($"{status}: {fileName}（{metadata.Annotations.Count} 件）", NotificationKind.Success);
         }
-        catch (OperationCanceledException) when (_isClosing)
+        catch (OperationCanceledException) when (_isClosing || _forceClose)
         {
-            // Window is closing; temporary files are removed in finally.
+            if (createdImage)
+            {
+                try { await Task.Run(() => File.Delete(target)); }
+                catch (IOException) { /* recover on next launch */ }
+                catch (UnauthorizedAccessException) { }
+            }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {
             if (createdImage)
             {
-                try { File.Delete(target); }
-                catch (IOException) { /* ロールバックできない場合、再試行で救済する */ }
-                catch (UnauthorizedAccessException) { /* 同上 */ }
+                try { await Task.Run(() => File.Delete(target)); }
+                catch (IOException) { /* ロールバックできない場合は再試行 */ }
+                catch (UnauthorizedAccessException) { }
             }
             _selectedCount = _thumbnailItems.Count(item => item.IsSaved);
             ShowNotification($"保存失敗（画像を進めない）: {ex.Message}", NotificationKind.Error);
@@ -742,8 +779,7 @@ public partial class MainWindow : Window
                     catch (UnauthorizedAccessException) { /* 削除権限なし */ }
                 }
             });
-            _fileOperationInProgress = false;
-            if (!_isClosing) UpdateControls();
+            FinishFileOperation();
         }
     }
 
