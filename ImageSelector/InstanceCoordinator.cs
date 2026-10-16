@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace ImageSelector;
@@ -41,6 +42,8 @@ internal sealed class InstanceCoordinator
 
             if (!owned && ready.WaitOne(0))
             {
+                // Give the active GUI permission to come forward from a taskbar relaunch.
+                NativeWindowFocus.AllowSetForegroundWindow(uint.MaxValue);
                 activation.Set();
                 CrashLogger.Trace("Instance detection: active window signalled");
                 return null;
@@ -138,4 +141,11 @@ internal sealed class InstanceCoordinator
     // Never release/dispose ownership here: the kernel mutex must remain owned
     // through .NET, native WIC, CLR and single-file host process teardown.
     internal void TraceExit() => CrashLogger.TraceResources("Instance process exit pending");
+}
+
+internal static partial class NativeWindowFocus
+{
+    [LibraryImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static partial bool AllowSetForegroundWindow(uint processId);
 }
