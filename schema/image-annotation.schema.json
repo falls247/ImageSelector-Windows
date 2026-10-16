@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/image-selector/image-annotation-v1.schema.json",
+  "title": "Image Selector annotation sidecar v1",
+  "description": "Annotation metadata stored adjacent to a selected image. Positioning and styling belong to the downstream renderer.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "imageFile",
+    "annotations",
+    "savedAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "imageFile": {
+      "type": "string",
+      "minLength": 1
+    },
+    "savedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "annotations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "text"
+        ],
+        "properties": {
+          "type": {
+            "enum": [
+              "dialogue",
+              "caption",
+              "sound_effect",
+              "speech_bubble"
+            ]
+          },
+          "speaker": {
+            "enum": [
+              "male",
+              "female"
+            ]
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "const": "dialogue"
+              }
+            },
+            "required": [
+              "speaker"
+            ]
+          },
+          {
+            "properties": {
+              "type": {
+                "const": "caption"
+              }
+            },
+            "not": {
+              "required": [
+                "speaker"
+              ]
+            }
+          },
+          {
+            "properties": {
+              "type": {
+                "const": "sound_effect"
+              }
+            },
+            "not": {
+              "required": [
+                "speaker"
+              ]
+            }
+          },
+          {
+            "properties": {
+              "type": {
+                "const": "speech_bubble"
+              }
+            },
+            "not": {
+              "required": [
+                "speaker"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

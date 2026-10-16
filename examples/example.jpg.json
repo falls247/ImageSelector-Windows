@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "imageFile": "example.jpg",
+  "annotations": [
+    { "type": "dialogue", "speaker": "male", "text": "おはよう" },
+    { "type": "dialogue", "speaker": "female", "text": "おはよう！" },
+    { "type": "caption", "text": "翌日の朝" },
+    { "type": "sound_effect", "text": "ドンッ" }
+  ],
+  "savedAt": "2026-10-11T18:30:00+09:00"
+}

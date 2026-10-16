@@ -1,0 +1,214 @@
+<Window x:Class="ImageSelector.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:ui="clr-namespace:ImageSelector.Ui"
+        Icon="Assets/ImageSelector.ico"
+        Title="Image Selector - 注釈付き画像選別"
+        Width="1400" Height="860" MinWidth="790" MinHeight="500"
+        WindowStartupLocation="CenterScreen"
+        Background="#121826" Foreground="#F1F5F9"
+        InputMethod.IsInputMethodEnabled="False"
+        Loaded="Window_Loaded"
+        PreviewKeyDown="Window_PreviewKeyDown">
+    <Window.Resources>
+        <ui:PercentToPixelsConverter x:Key="PercentToPixelsConverter" />
+        <BooleanToVisibilityConverter x:Key="BooleanToVisibilityConverter" />
+        <Style x:Key="ActionButton" TargetType="Button">
+            <Setter Property="Foreground" Value="#F8FAFC" />
+            <Setter Property="Background" Value="#334155" />
+            <Setter Property="BorderBrush" Value="#475569" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Padding" Value="5,6" />
+            <Setter Property="Margin" Value="2,2" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="MinHeight" Value="33" />
+            <Setter Property="HorizontalContentAlignment" Value="Center" />
+        </Style>
+        <Style x:Key="MutedText" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#A6B3C7" />
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="330" MinWidth="210" />
+            <ColumnDefinition Width="6" />
+            <ColumnDefinition Width="*" MinWidth="200" />
+        </Grid.ColumnDefinitions>
+
+        <Border Grid.Column="0" Background="#1E293B" Padding="8">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <Grid Grid.Row="0" Margin="0,0,0,6">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Button x:Name="OpenFolderButton" Grid.Column="0" Content="フォルダを開く" ToolTip="Ctrl+O"
+                            Style="{StaticResource ActionButton}" Click="OpenFolderButton_Click" />
+                    <TextBlock x:Name="FolderPathText" Grid.Column="1" Text="フォルダ未選択"
+                               Style="{StaticResource MutedText}"
+                               VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
+                               Margin="5,0,0,0" ToolTip="表示中のフォルダ" />
+                </Grid>
+
+                <Border x:Name="ThumbnailPanel" Grid.Row="1" Background="#162237"
+                        CornerRadius="6" Padding="5" Margin="0,0,0,7" ClipToBounds="True">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+                        <Grid Grid.Row="0" Margin="2,2,2,6">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <CheckBox x:Name="ShowThumbnailsCheckBox" Grid.Column="0"
+                                      Content="表示 (T)" IsChecked="True"
+                                      Foreground="#E2E8F0" FontSize="12"
+                                      VerticalAlignment="Center"
+                                      Click="ShowThumbnailsCheckBox_Click" />
+                            <Slider x:Name="ThumbSizeSlider" Grid.Column="1"
+                                    Minimum="50" Maximum="300" Value="100" Margin="10,0,6,0"
+                                    TickFrequency="10" IsSnapToTickEnabled="True"
+                                    SmallChange="10" LargeChange="25"
+                                    VerticalAlignment="Center"
+                                    ValueChanged="ThumbSizeSlider_ValueChanged" />
+                            <TextBlock x:Name="ThumbScaleText" Grid.Column="2" Text="100%"
+                                       Foreground="#E2E8F0" FontSize="12"
+                                       VerticalAlignment="Center" />
+                        </Grid>
+
+                        <!-- タイルは行単位で仮想化。非表示の行は画像もUIも生成しない。 -->
+                        <ListBox x:Name="ThumbnailList" Grid.Row="1"
+                                 Background="Transparent" BorderThickness="0"
+                                 Foreground="#F8FAFC" Focusable="False"
+                                 SizeChanged="ThumbnailList_SizeChanged"
+                                 ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                                 ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                 ScrollViewer.CanContentScroll="True"
+                                 VirtualizingPanel.IsVirtualizing="True"
+                                 VirtualizingPanel.VirtualizationMode="Standard"
+                                 VirtualizingPanel.ScrollUnit="Item">
+                            <ListBox.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <VirtualizingStackPanel Orientation="Vertical" />
+                                </ItemsPanelTemplate>
+                            </ListBox.ItemsPanel>
+                            <ListBox.ItemContainerStyle>
+                                <Style TargetType="ListBoxItem">
+                                    <Setter Property="Focusable" Value="False" />
+                                    <Setter Property="IsHitTestVisible" Value="True" />
+                                    <Setter Property="Padding" Value="0" />
+                                    <Setter Property="Margin" Value="0" />
+                                    <Setter Property="BorderThickness" Value="0" />
+                                    <Setter Property="Background" Value="Transparent" />
+                                    <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                </Style>
+                            </ListBox.ItemContainerStyle>
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <ItemsControl ItemsSource="{Binding Items}" Focusable="False">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <StackPanel Orientation="Horizontal" />
+                                            </ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <Border Margin="2" Padding="3" BorderThickness="2"
+                                                        MouseLeftButtonDown="ThumbnailTile_MouseLeftButtonDown"
+                                                        Cursor="Hand">
+                                                    <Border.Style>
+                                                        <Style TargetType="Border">
+                                                            <Setter Property="Background" Value="#1E293B" />
+                                                            <Setter Property="BorderBrush" Value="#475569" />
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding IsCurrent}" Value="True">
+                                                                    <Setter Property="Background" Value="#164E63" />
+                                                                    <Setter Property="BorderBrush" Value="#22D3EE" />
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </Border.Style>
+                                                    <StackPanel Width="{Binding ElementName=ThumbSizeSlider, Path=Value, Converter={StaticResource PercentToPixelsConverter}, ConverterParameter=98}">
+                                                        <Grid Height="{Binding ElementName=ThumbSizeSlider, Path=Value, Converter={StaticResource PercentToPixelsConverter}, ConverterParameter=72}"
+                                                              Background="#0B1220">
+                                                            <Image Source="{Binding Thumbnail}" Loaded="ThumbnailImage_Loaded"
+                                                                   Stretch="Uniform" SnapsToDevicePixels="True" />
+                                                            <Border Background="#047857" CornerRadius="3"
+                                                                    Padding="5,2" VerticalAlignment="Top" HorizontalAlignment="Right"
+                                                                    Visibility="{Binding IsSaved, Converter={StaticResource BooleanToVisibilityConverter}}"
+                                                                    ToolTip="選択済みの画像">
+                                                                <TextBlock Text="✓" Foreground="White" FontSize="12" FontWeight="Bold" />
+                                                            </Border>
+                                                        </Grid>
+                                                        <TextBlock Text="{Binding FileName}" ToolTip="{Binding FileName}"
+                                                                   FontSize="10" Margin="0,3,0,0"
+                                                                   TextTrimming="CharacterEllipsis" TextAlignment="Center" />
+                                                    </StackPanel>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </Grid>
+                </Border>
+
+                <StackPanel Grid.Row="2">
+                    <TextBlock x:Name="CurrentFileNameText" Text="画像なし" FontSize="13"
+                               FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Margin="3,0,3,5" />
+                    <WrapPanel Orientation="Horizontal" Margin="3,0,0,7">
+                        <TextBlock x:Name="PositionText" Text="0/0" Style="{StaticResource MutedText}"
+                                   FontSize="11" Margin="0,0,13,3" />
+                        <TextBlock x:Name="SelectedCountText" Text="選択済み 0/0件" Style="{StaticResource MutedText}"
+                                   FontSize="11" Margin="0,0,13,3" />
+                        <TextBlock x:Name="AnnotationCountText" Text="注釈 0件" Style="{StaticResource MutedText}"
+                                   FontSize="11" Margin="0,0,0,3" />
+                    </WrapPanel>
+                    <UniformGrid Columns="2" Rows="3">
+                        <Button x:Name="PreviousButton" Content="← 前へ" Style="{StaticResource ActionButton}" Click="PreviousButton_Click" />
+                        <Button x:Name="NextButton" Content="次へ →" Style="{StaticResource ActionButton}" Click="NextButton_Click" />
+                        <Button x:Name="AnnotateButton" Content="注釈 (Space)" Style="{StaticResource ActionButton}" Click="AnnotateButton_Click" />
+                        <Button x:Name="SelectButton" Content="保存 (Enter)" Style="{StaticResource ActionButton}" Background="#0F766E" Click="SelectButton_Click" />
+                        <Button x:Name="DeleteButton" Content="元画像削除" ToolTip="Delete" Style="{StaticResource ActionButton}" Background="#B91C1C" Click="DeleteButton_Click" />
+                        <Button x:Name="DeleteSelectedCopyButton" Content="選択取消" ToolTip="Alt+Delete" Style="{StaticResource ActionButton}" Background="#6D28D9" Click="DeleteSelectedCopyButton_Click" />
+                    </UniformGrid>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <GridSplitter Grid.Column="1" Width="6" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                      Background="#334155" ShowsPreview="True" />
+
+        <Border x:Name="ImageViewport" Grid.Column="2" Margin="5" CornerRadius="4" Background="#090E18" ClipToBounds="True"
+                SizeChanged="ImageViewport_SizeChanged">
+            <Grid>
+                <Image x:Name="ImageDisplay" Stretch="Uniform"
+                       HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                       SnapsToDevicePixels="True" />
+                <TextBlock x:Name="PlaceholderText"
+                           Text="フォルダを選択すると画像を表示"
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           Foreground="#94A3B8" FontSize="18"
+                           TextAlignment="Center" />
+                <Border x:Name="NoticeBorder" Visibility="Collapsed"
+                        HorizontalAlignment="Right" VerticalAlignment="Top"
+                        Margin="20" Padding="14,10"
+                        MaxWidth="520" CornerRadius="8" Background="#065F46">
+                    <TextBlock x:Name="NoticeText" TextWrapping="Wrap"
+                               Foreground="White" FontSize="14" FontWeight="SemiBold" />
+                </Border>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>
