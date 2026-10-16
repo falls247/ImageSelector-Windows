@@ -55,6 +55,8 @@ public partial class MainWindow : Window
     private bool _fileOperationInProgress;
     private readonly Dictionary<string, List<ImageAnnotation>> _drafts = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _unsavedDrafts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _metadataExists = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _metadataLoading = new(StringComparer.OrdinalIgnoreCase);
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -219,6 +221,11 @@ public partial class MainWindow : Window
             _drafts.Clear();
             _unsavedDrafts.Clear();
             _invalidMetadata.Clear();
+            _metadataExists.Clear();
+            _metadataLoading.Clear();
+            foreach (var name in existingSelectedFiles)
+                if (name.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+                    _metadataExists.Add(name);
             _imageFiles = images;
             _currentIndex = 0;
             _highlightedThumbnail = null;
@@ -319,6 +326,7 @@ public partial class MainWindow : Window
         var width = Math.Max(1, ImageViewport.ActualWidth * dpi.DpiScaleX * 1.25);
         var height = Math.Max(1, ImageViewport.ActualHeight * dpi.DpiScaleY * 1.25);
         _ = LoadPreviewAsync(path, width, height, token);
+        _ = EnsureAnnotationsLoadedAsync(path);
     }
 
     private async Task LoadPreviewAsync(string path, double targetWidth, double targetHeight, CancellationToken token)
@@ -476,8 +484,9 @@ public partial class MainWindow : Window
         if (hasImage)
         {
             var currentPath = _imageFiles[_currentIndex];
-            var count = GetAnnotations(currentPath).Count;
-            AnnotationCountText.Text = $"注釈 {count}件"
+            var countText = _drafts.TryGetValue(currentPath, out var annotations)
+                ? annotations.Count.ToString() : "…";
+            AnnotationCountText.Text = $"注釈 {countText}件"
                 + (_unsavedDrafts.Contains(currentPath) ? "*" : "");
         }
         else
@@ -531,6 +540,8 @@ public partial class MainWindow : Window
         if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _imageFiles.Count == 0) return;
 
         var current = _imageFiles[_currentIndex];
+        await EnsureAnnotationsLoadedAsync(current);
+        if (_isClosing || !_imageFiles.Contains(current)) return;
         // Alt+Enter は編集中の注釈だけをメモリ上の下書きへ反映し、画面は閉じない。
         // Ctrl+Enter のみウィンドウを閉じ、画像とJSONの保存へ進む。
         var editor = new AnnotationEditor(
@@ -552,42 +563,62 @@ public partial class MainWindow : Window
         }
     }
 
-    // 保存済みJSONを再読込することで、アプリを再起動した後も注釈を再編集できる。
-    private List<ImageAnnotation> GetAnnotations(string source)
+    // Disk I/O for annotation metadata always runs off the WPF dispatcher.
+    // The UI displays "…" until the metadata for a new image has been loaded.
+    private async Task EnsureAnnotationsLoadedAsync(string source)
     {
-        if (_drafts.TryGetValue(source, out var draft)) return draft;
-        if (_currentFolder is null) return new();
-
-        var jsonPath = Path.Combine(GetSelectedFolder(_currentFolder), Path.GetFileName(source) + ".json");
-        if (!File.Exists(jsonPath))
-        {
-            _drafts[source] = new();
-            return _drafts[source];
-        }
-
+        if (_isClosing || _drafts.ContainsKey(source) || !_metadataLoading.Add(source)) return;
+        var folder = _currentFolder;
+        if (folder is null) { _metadataLoading.Remove(source); return; }
+        var token = _thumbnailLoadCts.Token;
+        var jsonName = Path.GetFileName(source) + ".json";
         try
         {
-            if (new FileInfo(jsonPath).Length > 2 * 1024 * 1024)
-                throw new InvalidDataException("注釈JSONが上限2MBを超えています");
-            var data = JsonSerializer.Deserialize<ImageMetadata>(File.ReadAllText(jsonPath, Encoding.UTF8), JsonOptions);
-            if (data is null || data.SchemaVersion != 1 || data.ImageFile != Path.GetFileName(source))
+            if (!_metadataExists.Contains(jsonName))
             {
-                throw new JsonException("JSONの形式または画像ファイル名が一致しない");
+                _drafts[source] = new();
+                return;
             }
-            if (data.Annotations?.Any(x => x is null) == true)
-                throw new JsonException("注釈配列に null の要素があります");
-            _drafts[source] = (data.Annotations ?? new()).Select(x => x.Clone()).ToList();
+
+            var jsonPath = Path.Combine(GetSelectedFolder(folder), jsonName);
+            var data = await Task.Run(() =>
+            {
+                token.ThrowIfCancellationRequested();
+                if (new FileInfo(jsonPath).Length > 2 * 1024 * 1024)
+                    throw new InvalidDataException("注釈JSONが上限2MBを超えています");
+                var parsed = JsonSerializer.Deserialize<ImageMetadata>(
+                    File.ReadAllText(jsonPath, Encoding.UTF8), JsonOptions);
+                token.ThrowIfCancellationRequested();
+                if (parsed is null || parsed.SchemaVersion != 1 ||
+                    parsed.ImageFile != Path.GetFileName(source))
+                    throw new JsonException("JSONの形式または画像ファイル名が一致しない");
+                if (parsed.Annotations?.Any(x => x is null) == true)
+                    throw new JsonException("注釈配列に null の要素があります");
+                return (parsed.Annotations ?? new()).Select(x => x.Clone()).ToList();
+            }, token);
+            if (!_isClosing && !token.IsCancellationRequested && _currentFolder == folder)
+                _drafts[source] = data;
         }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            // 破損JSONを空データで無断上書きしない。Enterで保存する前に修正が必要。
-            CrashLogger.Write("GetAnnotations: " + jsonPath, ex);
-            ShowNotification($"注釈JSONを読めない: {ex.Message}", NotificationKind.Error);
+            if (_isClosing || token.IsCancellationRequested || _currentFolder != folder) return;
+            CrashLogger.Write("EnsureAnnotationsLoadedAsync: " + jsonName, ex);
             _drafts[source] = new();
             _invalidMetadata.Add(source);
+            ShowNotification($"注釈JSONを読めない: {ex.Message}", NotificationKind.Error);
         }
-        return _drafts[source];
+        finally
+        {
+            _metadataLoading.Remove(source);
+            if (!_isClosing && _currentFolder == folder && _imageFiles.Count > 0 &&
+                string.Equals(_imageFiles[_currentIndex], source, StringComparison.OrdinalIgnoreCase))
+                UpdateControls();
+        }
     }
+
+    private List<ImageAnnotation> GetAnnotations(string source) =>
+        _drafts.TryGetValue(source, out var draft) ? draft : new();
 
     private readonly HashSet<string> _invalidMetadata = new(StringComparer.OrdinalIgnoreCase);
 
