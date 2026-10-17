@@ -33,6 +33,9 @@ jobs:
       - name: Run real WIC image decode regression checks
         shell: pwsh
         run: dotnet run --project .\tests\DecodeIntegrationChecks.csproj -c Release
+      - name: Check thumbnail filtering and navigation
+        shell: pwsh
+        run: dotnet run --project .\tests\ThumbnailFilterChecks.csproj -c Release
       - name: Check cross-process single-instance ownership
         shell: pwsh
         run: |

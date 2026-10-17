@@ -34,15 +34,20 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _resizeTimer = new();
     private List<string> _imageFiles = new();
     private readonly ObservableCollection<ThumbnailItem> _thumbnailItems = new();
+    private readonly Dictionary<string, ThumbnailItem> _thumbnailItemsByPath = new(StringComparer.OrdinalIgnoreCase);
+    private List<ThumbnailItem> _filteredThumbnailItems = new();
     private List<ThumbnailRow> _thumbnailRows = new();
     private readonly DispatcherTimer _thumbnailLayoutTimer = new();
+    private readonly DispatcherTimer _thumbnailFilterTimer = new();
     private readonly SemaphoreSlim _thumbnailDecodeSlots = new(1, 1);
     private const int ThumbnailCacheLimit = 160;
     private readonly LinkedList<ThumbnailItem> _thumbnailCacheOrder = new();
     private readonly SemaphoreSlim _previewDecodeSlots = new(1, 1);
+    private readonly SemaphoreSlim _metadataReadSlots = new(3, 3);
     private CancellationTokenSource _thumbnailLoadCts = new();
     private CancellationTokenSource? _previewLoadCts;
     private CancellationTokenSource? _folderLoadCts;
+    private CancellationTokenSource? _annotationFilterLoadCts;
     private readonly CancellationTokenSource _lifetimeCts = new();
     private bool _isClosing;
     private bool _folderPickerOpen;
@@ -55,6 +60,10 @@ public partial class MainWindow : Window
     private int _currentIndex;
     private int _selectedCount;
     private bool _fileOperationInProgress;
+    private bool _annotationEditorOpen;
+    private bool HasCurrentImage => _currentIndex >= 0 && _currentIndex < _imageFiles.Count;
+    private int CurrentFilteredIndex => HasCurrentImage
+        ? _filteredThumbnailItems.IndexOf(_thumbnailItems[_currentIndex]) : -1;
     private readonly Dictionary<string, List<ImageAnnotation>> _drafts = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _unsavedDrafts = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _metadataExists = new(StringComparer.OrdinalIgnoreCase);
@@ -79,6 +88,9 @@ public partial class MainWindow : Window
             RebuildThumbnailRows();
         };
 
+        _thumbnailFilterTimer.Interval = TimeSpan.FromMilliseconds(120);
+        _thumbnailFilterTimer.Tick += (_, _) => ApplyPendingThumbnailFilters();
+
         _notificationTimer = new DispatcherTimer
         {
             Interval = TimeSpan.FromSeconds(2.5)
@@ -93,7 +105,7 @@ public partial class MainWindow : Window
         _resizeTimer.Tick += (_, _) =>
         {
             _resizeTimer.Stop();
-            if (!_isClosing && !_fileOperationInProgress && _imageFiles.Count > 0) RenderCurrentImage();
+            if (!_isClosing && !_fileOperationInProgress && HasCurrentImage) RenderCurrentImage();
         };
 
         UpdateControls();
@@ -169,7 +181,11 @@ public partial class MainWindow : Window
     private void FinishFileOperation()
     {
         _fileOperationInProgress = false;
-        if (!_isClosing) UpdateControls();
+        if (!_isClosing)
+        {
+            ApplyPendingThumbnailFilters();
+            UpdateControls();
+        }
         if (_closeRequested && !_isClosing)
             Dispatcher.BeginInvoke(new Action(Close), DispatcherPriority.Background);
     }
@@ -182,6 +198,8 @@ public partial class MainWindow : Window
         _notificationTimer.Stop();
         _resizeTimer.Stop();
         _thumbnailLayoutTimer.Stop();
+        _thumbnailFilterTimer.Stop();
+        _annotationFilterLoadCts?.Cancel();
         _folderLoadCts?.Cancel();
         _lifetimeCts.Cancel();
         _previewLoadCts?.Cancel();
@@ -192,6 +210,8 @@ public partial class MainWindow : Window
         _thumbnailCacheOrder.Clear();
         _thumbnailRows.Clear();
         _thumbnailItems.Clear();
+        _thumbnailItemsByPath.Clear();
+        _filteredThumbnailItems.Clear();
         _imageFiles.Clear();
         _drafts.Clear();
         _unsavedDrafts.Clear();
@@ -212,6 +232,7 @@ public partial class MainWindow : Window
     {
         if (_isClosing) return;
         _folderLoadCts?.Cancel();
+        _annotationFilterLoadCts?.Cancel();
         var request = new CancellationTokenSource();
         _folderLoadCts = request;
         _folderLoadInProgress = true;
@@ -285,17 +306,24 @@ public partial class MainWindow : Window
             _highlightedThumbnail = null;
 
             _thumbnailItems.Clear();
+            _thumbnailItemsByPath.Clear();
             foreach (var image in images)
-                _thumbnailItems.Add(new ThumbnailItem(image,
-                    existingSelectedFiles.Contains(Path.GetFileName(image))));
+            {
+                var item = new ThumbnailItem(image,
+                    existingSelectedFiles.Contains(Path.GetFileName(image)),
+                    _metadataExists.Contains(Path.GetFileName(image) + ".json"));
+                _thumbnailItems.Add(item);
+                _thumbnailItemsByPath.Add(image, item);
+            }
             _selectedCount = _thumbnailItems.Count(item => item.IsSaved);
-            RebuildThumbnailRows();
+            RefreshThumbnailFilter();
             FolderPathText.Text = fullFolder;
             FolderPathText.ToolTip = fullFolder;
             Title = $"Image Selector — 注釈付き選別 — {Path.GetFileName(Path.TrimEndingDirectorySeparator(fullFolder))}";
             _notificationTimer.Stop();
             NoticeBorder.Visibility = Visibility.Collapsed;
             RenderCurrentImage();
+            _ = LoadAnnotationFilterMetadataAsync();
             CrashLogger.Trace($"LoadFolder UI ready: {images.Count} files, {clock.ElapsedMilliseconds} ms");
             if (images.Count == 0)
                 ShowNotification("対応画像が見つからないフォルダ", NotificationKind.Information);
@@ -351,17 +379,16 @@ public partial class MainWindow : Window
         var token = _previewLoadCts.Token;
 
         ImageDisplay.Source = null;
-        if (_imageFiles.Count > 0 && (_currentIndex < 0 || _currentIndex >= _imageFiles.Count))
-            _currentIndex = Math.Clamp(_currentIndex, 0, _imageFiles.Count - 1);
-
-        if (_imageFiles.Count == 0)
+        if (!HasCurrentImage)
         {
             PlaceholderText.Text = _currentFolder is null
                 ? "フォルダを選択すると画像を表示"
-                : "このフォルダに対応画像がない";
+                : _imageFiles.Count == 0 ? "このフォルダに対応画像がない"
+                : _annotationFilterLoadCts is not null ? "注釈を確認中…"
+                : "フィルター条件に一致する画像がない";
             PlaceholderText.Visibility = Visibility.Visible;
-            CurrentFileNameText.Text = "画像なし";
-            _highlightedThumbnail = null;
+            CurrentFileNameText.Text = _imageFiles.Count == 0 ? "画像なし" : "該当画像なし";
+            SyncThumbnailSelection();
             UpdateControls();
             return;
         }
@@ -391,7 +418,7 @@ public partial class MainWindow : Window
             await _previewDecodeSlots.WaitAsync(token);
             acquired = true;
             var bitmap = await ImageLoader.PreviewAsync(path, targetWidth, targetHeight, token);
-            if (_isClosing || token.IsCancellationRequested || _imageFiles.Count == 0 ||
+            if (_isClosing || token.IsCancellationRequested || !HasCurrentImage ||
                 !string.Equals(_imageFiles[_currentIndex], path, StringComparison.OrdinalIgnoreCase)) return;
 
             ImageDisplay.Source = bitmap;
@@ -418,6 +445,97 @@ public partial class MainWindow : Window
         }
     }
 
+    private bool MatchesThumbnailFilter(ThumbnailItem item) =>
+        (SelectedOnlyFilterCheckBox.IsChecked != true || item.IsSaved) &&
+        (AnnotatedOnlyFilterCheckBox.IsChecked != true || item.AnnotationStatus == AnnotationStatus.Present);
+
+    private void RefreshThumbnailFilter()
+    {
+        var filtered = _thumbnailItems.Where(MatchesThumbnailFilter).ToList();
+        var changed = !_filteredThumbnailItems.SequenceEqual(filtered);
+        _filteredThumbnailItems = filtered;
+        if (!HasCurrentImage || !MatchesThumbnailFilter(_thumbnailItems[_currentIndex]))
+        {
+            var next = _thumbnailItems.Skip(Math.Max(0, _currentIndex)).FirstOrDefault(MatchesThumbnailFilter)
+                ?? _filteredThumbnailItems.LastOrDefault();
+            _currentIndex = next is null ? -1 : _thumbnailItems.IndexOf(next);
+        }
+        if (changed) RebuildThumbnailRows();
+    }
+
+    private void ApplyThumbnailFilters()
+    {
+        _thumbnailFilterTimer.Stop();
+        var previousIndex = _currentIndex;
+        RefreshThumbnailFilter();
+        if (_currentIndex != previousIndex || !HasCurrentImage) RenderCurrentImage();
+        else UpdateControls();
+    }
+
+    private void ApplyPendingThumbnailFilters()
+    {
+        // 注釈画面と保存処理が参照する画像を、処理の途中で切り替えない。
+        if (_isClosing || _fileOperationInProgress || _folderLoadInProgress || _annotationEditorOpen ||
+            !_thumbnailFilterTimer.IsEnabled) return;
+        ApplyThumbnailFilters();
+    }
+
+    private void ScheduleThumbnailFilterRefresh()
+    {
+        if (!_isClosing && !_thumbnailFilterTimer.IsEnabled) _thumbnailFilterTimer.Start();
+    }
+
+    private void ThumbnailFilter_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_isClosing || _fileOperationInProgress || _folderLoadInProgress) return;
+        ApplyThumbnailFilters();
+        _ = LoadAnnotationFilterMetadataAsync();
+    }
+
+    private async Task LoadAnnotationFilterMetadataAsync()
+    {
+        _annotationFilterLoadCts?.Cancel();
+        _annotationFilterLoadCts = null;
+        if (_isClosing || AnnotatedOnlyFilterCheckBox.IsChecked != true)
+        {
+            UpdateControls();
+            return;
+        }
+
+        // 画面外の注釈も判定する。本文は保持せず、同時読込は3件まで。
+        var pending = new Queue<string>(_thumbnailItems.Where(item =>
+            item.AnnotationStatus == AnnotationStatus.Pending &&
+            (SelectedOnlyFilterCheckBox.IsChecked != true || item.IsSaved)).Select(item => item.Path));
+        var request = CancellationTokenSource.CreateLinkedTokenSource(_thumbnailLoadCts.Token, _lifetimeCts.Token);
+        _annotationFilterLoadCts = request;
+        var token = request.Token;
+        UpdateControls();
+        if (!HasCurrentImage) RenderCurrentImage();
+        try
+        {
+            async Task ReadNextAsync()
+            {
+                while (!token.IsCancellationRequested && pending.TryDequeue(out var source))
+                    await EnsureAnnotationsLoadedAsync(source, loadDraft: false);
+            }
+            await Task.WhenAll(Enumerable.Range(0, 3).Select(_ => ReadNextAsync()));
+        }
+        finally
+        {
+            if (ReferenceEquals(_annotationFilterLoadCts, request))
+            {
+                _annotationFilterLoadCts = null;
+                if (!_isClosing)
+                {
+                    ScheduleThumbnailFilterRefresh();
+                    ApplyPendingThumbnailFilters();
+                    UpdateControls();
+                }
+            }
+            request.Dispose();
+        }
+    }
+
     // 行単位の仮想化。WrapPanel直結では全500枚の要素が一度に生成されてしまう。
     private void RebuildThumbnailRows()
     {
@@ -425,12 +543,12 @@ public partial class MainWindow : Window
         var tileWidth = 98.0 * ThumbSizeSlider.Value / 100.0 + 14.0;
         var available = Math.Max(1, ThumbnailList.ActualWidth - 20);
         _thumbnailColumns = Math.Max(1, (int)(available / tileWidth));
-        var rows = new List<ThumbnailRow>((_thumbnailItems.Count + _thumbnailColumns - 1) / _thumbnailColumns);
-        for (var i = 0; i < _thumbnailItems.Count; i += _thumbnailColumns)
+        var rows = new List<ThumbnailRow>((_filteredThumbnailItems.Count + _thumbnailColumns - 1) / _thumbnailColumns);
+        for (var i = 0; i < _filteredThumbnailItems.Count; i += _thumbnailColumns)
         {
-            var count = Math.Min(_thumbnailColumns, _thumbnailItems.Count - i);
+            var count = Math.Min(_thumbnailColumns, _filteredThumbnailItems.Count - i);
             var items = new List<ThumbnailItem>(count);
-            for (var j = 0; j < count; j++) items.Add(_thumbnailItems[i + j]);
+            for (var j = 0; j < count; j++) items.Add(_filteredThumbnailItems[i + j]);
             rows.Add(new ThumbnailRow(items));
         }
         _thumbnailRows = rows;
@@ -440,7 +558,12 @@ public partial class MainWindow : Window
 
     private void SyncThumbnailSelection()
     {
-        if (_thumbnailItems.Count == 0) return;
+        if (!HasCurrentImage)
+        {
+            if (_highlightedThumbnail is not null) _highlightedThumbnail.IsCurrent = false;
+            _highlightedThumbnail = null;
+            return;
+        }
         var item = _thumbnailItems[_currentIndex];
         if (!ReferenceEquals(item, _highlightedThumbnail))
         {
@@ -449,7 +572,9 @@ public partial class MainWindow : Window
             _highlightedThumbnail = item;
         }
         if (ThumbnailList.Visibility != Visibility.Visible || _thumbnailRows.Count == 0) return;
-        var rowIndex = Math.Min(_currentIndex / _thumbnailColumns, _thumbnailRows.Count - 1);
+        var filteredIndex = CurrentFilteredIndex;
+        if (filteredIndex < 0) return;
+        var rowIndex = Math.Min(filteredIndex / _thumbnailColumns, _thumbnailRows.Count - 1);
         ThumbnailList.ScrollIntoView(_thumbnailRows[rowIndex]);
     }
 
@@ -507,6 +632,7 @@ public partial class MainWindow : Window
     {
         if (_isClosing || sender is not Image { DataContext: ThumbnailItem item }) return;
         item.RealizedCount++;
+        _ = EnsureAnnotationsLoadedAsync(item.Path);
         if (item.Thumbnail is not null)
         {
             TouchThumbnailCache(item);
@@ -570,21 +696,27 @@ public partial class MainWindow : Window
     private void UpdateControls()
     {
         if (_isClosing) return;
-        var hasImage = _imageFiles.Count > 0;
+        var hasImage = HasCurrentImage;
+        var filteredIndex = CurrentFilteredIndex;
         var busy = _fileOperationInProgress || _folderLoadInProgress;
         // Cached selection state: avoid redundant synchronous I/O for every keypress.
         var hasSelectedCopy = hasImage && _thumbnailItems[_currentIndex].IsSaved;
 
-        PreviousButton.IsEnabled = hasImage && !busy && _currentIndex > 0;
-        NextButton.IsEnabled = hasImage && !busy && _currentIndex < _imageFiles.Count - 1;
+        PreviousButton.IsEnabled = hasImage && !busy && filteredIndex > 0;
+        NextButton.IsEnabled = hasImage && !busy && filteredIndex < _filteredThumbnailItems.Count - 1;
         SelectButton.IsEnabled = hasImage && !busy;
         DeleteButton.IsEnabled = hasImage && !busy;
         DeleteSelectedCopyButton.IsEnabled = hasImage && !busy && hasSelectedCopy;
         AnnotateButton.IsEnabled = hasImage && !busy;
         OpenFolderButton.IsEnabled = !_fileOperationInProgress;
-        ThumbnailList.IsEnabled = hasImage && !busy;
+        // 入力だけ止め、無効化時の標準テーマで背景が白くなるのを防ぐ。
+        ThumbnailList.IsHitTestVisible = hasImage && !busy;
+        SelectedOnlyFilterCheckBox.IsEnabled = !busy;
+        AnnotatedOnlyFilterCheckBox.IsEnabled = !busy;
 
-        PositionText.Text = hasImage ? $"{_currentIndex + 1}/{_imageFiles.Count}" : "0/0";
+        PositionText.Text = hasImage ? $"{filteredIndex + 1}/{_filteredThumbnailItems.Count}" : "0/0";
+        ThumbnailFilterStatusText.Text = $"表示 {_filteredThumbnailItems.Count}/{_imageFiles.Count}件"
+            + (_annotationFilterLoadCts is not null ? "・注釈を確認中…" : "");
 
         if (_currentFolder is null)
         {
@@ -610,18 +742,18 @@ public partial class MainWindow : Window
 
     private void Navigate(int direction)
     {
-        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _imageFiles.Count == 0)
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || !HasCurrentImage)
         {
             return;
         }
 
-        var next = _currentIndex + direction;
-        if (next < 0 || next >= _imageFiles.Count)
+        var next = CurrentFilteredIndex + direction;
+        if (next < 0 || next >= _filteredThumbnailItems.Count)
         {
             return; // 端で止まる。先頭や末尾には循環しない。
         }
 
-        _currentIndex = next;
+        _currentIndex = _thumbnailItems.IndexOf(_filteredThumbnailItems[next]);
         RenderCurrentImage();
     }
 
@@ -629,7 +761,7 @@ public partial class MainWindow : Window
     // サイドバー幅やサムネイル倍率を変更直後の場合は、まず行レイアウトを更新する。
     private void NavigateThumbnailVertical(int rowDirection)
     {
-        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _imageFiles.Count == 0 ||
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || !HasCurrentImage ||
             ThumbnailList.Visibility != Visibility.Visible)
             return;
 
@@ -639,22 +771,22 @@ public partial class MainWindow : Window
             RebuildThumbnailRows();
         }
 
-        var next = _currentIndex + rowDirection * _thumbnailColumns;
+        var next = CurrentFilteredIndex + rowDirection * _thumbnailColumns;
         // 最終行が途中で終わるとき、真下にタイルがなければ移動しない。
-        if (next < 0 || next >= _imageFiles.Count)
+        if (next < 0 || next >= _filteredThumbnailItems.Count)
             return;
 
-        _currentIndex = next;
+        _currentIndex = _thumbnailItems.IndexOf(_filteredThumbnailItems[next]);
         RenderCurrentImage(); // 選択中のタイル・スクロール位置も同期する
     }
 
     private async Task OpenAnnotationEditorAsync()
     {
-        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _imageFiles.Count == 0) return;
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || !HasCurrentImage || _annotationEditorOpen) return;
 
         var current = _imageFiles[_currentIndex];
         await EnsureAnnotationsLoadedAsync(current);
-        if (_isClosing || _imageFiles.Count == 0 ||
+        if (_isClosing || !HasCurrentImage ||
             !string.Equals(_imageFiles[_currentIndex], current, StringComparison.OrdinalIgnoreCase)) return;
         // Alt+Enter は編集中の注釈だけをメモリ上の下書きへ反映し、画面は閉じない。
         // Ctrl+Enter のみウィンドウを閉じ、画像とJSONの保存へ進む。
@@ -664,27 +796,42 @@ public partial class MainWindow : Window
             {
                 _drafts[current] = annotations.Select(a => a.Clone()).ToList();
                 _unsavedDrafts.Add(current);
+                UpdateThumbnailAnnotationStatus(current);
                 UpdateControls();
             }) { Owner = this };
 
-        if (editor.ShowDialog() == true)
+        _annotationEditorOpen = true;
+        try
         {
-            _drafts[current] = editor.Result.Select(a => a.Clone()).ToList();
-            _unsavedDrafts.Add(current);
-            UpdateControls();
-            if (editor.SaveAndSelectRequested)
-                await SelectCurrentAsync();
+            if (editor.ShowDialog() == true)
+            {
+                _drafts[current] = editor.Result.Select(a => a.Clone()).ToList();
+                _unsavedDrafts.Add(current);
+                UpdateThumbnailAnnotationStatus(current);
+                UpdateControls();
+                if (editor.SaveAndSelectRequested)
+                    await SelectCurrentAsync();
+            }
+        }
+        finally
+        {
+            _annotationEditorOpen = false;
+            ApplyPendingThumbnailFilters();
         }
     }
 
     // Disk I/O for annotation metadata always runs off the WPF dispatcher.
     // The UI displays "…" until the metadata for a new image has been loaded.
-    private async Task EnsureAnnotationsLoadedAsync(string source)
+    private async Task EnsureAnnotationsLoadedAsync(string source, bool loadDraft = true)
     {
         if (_isClosing || _drafts.ContainsKey(source)) return;
+        var token = _thumbnailLoadCts.Token;
         if (_metadataRequests.TryGetValue(source, out var existing))
         {
             await existing.Task;
+            // フィルター用の読込は状態のみ保持する。編集・保存には本文も必要。
+            if (loadDraft && !token.IsCancellationRequested)
+                await EnsureAnnotationsLoadedAsync(source);
             return;
         }
         var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -696,17 +843,21 @@ public partial class MainWindow : Window
             completion.TrySetResult(true);
             return;
         }
-        var token = _thumbnailLoadCts.Token;
         var jsonName = Path.GetFileName(source) + ".json";
+        var acquired = false;
+        AnnotationStatus? loadedStatus = null;
         try
         {
             if (!_metadataExists.Contains(jsonName))
             {
-                _drafts[source] = new();
+                if (loadDraft) _drafts[source] = new();
+                loadedStatus = AnnotationStatus.Empty;
                 return;
             }
 
             var jsonPath = Path.Combine(GetSelectedFolder(folder), jsonName);
+            await _metadataReadSlots.WaitAsync(token);
+            acquired = true;
             var data = await Task.Run(() =>
             {
                 token.ThrowIfCancellationRequested();
@@ -723,26 +874,56 @@ public partial class MainWindow : Window
                 return (parsed.Annotations ?? new()).Select(x => x.Clone()).ToList();
             }, token);
             if (!_isClosing && !token.IsCancellationRequested && _currentFolder == folder)
-                _drafts[source] = data;
+            {
+                loadedStatus = data.Any(annotation => !string.IsNullOrWhiteSpace(annotation.Text))
+                    ? AnnotationStatus.Present : AnnotationStatus.Empty;
+                if (loadDraft) _drafts.TryAdd(source, data);
+            }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            if (_isClosing || token.IsCancellationRequested || _currentFolder != folder) return;
+            if (_isClosing || token.IsCancellationRequested || _currentFolder != folder ||
+                _drafts.ContainsKey(source)) return;
             CrashLogger.Write("EnsureAnnotationsLoadedAsync: " + jsonName, ex);
-            _drafts[source] = new();
-            _invalidMetadata.Add(source);
-            ShowNotification($"注釈JSONを読めない: {ex.Message}", NotificationKind.Error);
+            loadedStatus = AnnotationStatus.Invalid;
+            if (loadDraft)
+            {
+                _drafts[source] = new();
+                _invalidMetadata.Add(source);
+                ShowNotification($"注釈JSONを読めない: {ex.Message}", NotificationKind.Error);
+            }
         }
         finally
         {
+            if (acquired) _metadataReadSlots.Release();
             if (_metadataRequests.TryGetValue(source, out var active) &&
                 ReferenceEquals(active, completion)) _metadataRequests.Remove(source);
             completion.TrySetResult(true);
-            if (!_isClosing && _currentFolder == folder && _imageFiles.Count > 0 &&
-                string.Equals(_imageFiles[_currentIndex], source, StringComparison.OrdinalIgnoreCase))
-                UpdateControls();
+            if (!_isClosing && !token.IsCancellationRequested && _currentFolder == folder)
+            {
+                UpdateThumbnailAnnotationStatus(source, loadedStatus);
+                if (HasCurrentImage &&
+                    string.Equals(_imageFiles[_currentIndex], source, StringComparison.OrdinalIgnoreCase))
+                    UpdateControls();
+            }
         }
+    }
+
+    private void UpdateThumbnailAnnotationStatus(string source, AnnotationStatus? loadedStatus = null)
+    {
+        if (!_thumbnailItemsByPath.TryGetValue(source, out var item)) return;
+        var status = _invalidMetadata.Contains(source)
+            ? AnnotationStatus.Invalid
+            : _drafts.TryGetValue(source, out var annotations)
+                ? annotations.Any(annotation => !string.IsNullOrWhiteSpace(annotation.Text))
+                    ? AnnotationStatus.Present : AnnotationStatus.Empty
+                : loadedStatus ?? item.AnnotationStatus;
+        if (item.AnnotationStatus == status) return;
+        var wasAnnotated = item.AnnotationStatus == AnnotationStatus.Present;
+        item.AnnotationStatus = status;
+        if (AnnotatedOnlyFilterCheckBox.IsChecked == true && wasAnnotated != (status == AnnotationStatus.Present))
+            ScheduleThumbnailFilterRefresh();
     }
 
     private List<ImageAnnotation> GetAnnotations(string source) =>
@@ -752,7 +933,7 @@ public partial class MainWindow : Window
 
     private async Task SelectCurrentAsync()
     {
-        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _currentFolder is null || _imageFiles.Count == 0) return;
+        if (_isClosing || _folderLoadInProgress || _fileOperationInProgress || _currentFolder is null || !HasCurrentImage) return;
 
         var source = _imageFiles[_currentIndex];
         _fileOperationInProgress = true;
@@ -827,6 +1008,7 @@ public partial class MainWindow : Window
             _metadataExists.Add(fileName + ".json");
             if (createdImage) _selectedCount++;
             _thumbnailItems[_currentIndex].IsSaved = true;
+            if (SelectedOnlyFilterCheckBox.IsChecked == true) ScheduleThumbnailFilterRefresh();
             _unsavedDrafts.Remove(source);
             var status = createdImage ? "画像＋注釈JSONを保存" : "既存画像の注釈JSONを更新";
             NavigateAfterSelection();
@@ -872,7 +1054,7 @@ public partial class MainWindow : Window
     private async Task DeleteSelectedCopyArtifactsAsync()
     {
         if (_isClosing || _folderLoadInProgress || _fileOperationInProgress ||
-            _currentFolder is null || _imageFiles.Count == 0) return;
+            _currentFolder is null || !HasCurrentImage) return;
 
         var source = _imageFiles[_currentIndex];
         var fileName = Path.GetFileName(source);
@@ -910,6 +1092,8 @@ public partial class MainWindow : Window
             _invalidMetadata.Remove(source);
             _metadataExists.Remove(fileName + ".json");
             _thumbnailItems[_currentIndex].IsSaved = false;
+            if (SelectedOnlyFilterCheckBox.IsChecked == true) ScheduleThumbnailFilterRefresh();
+            UpdateThumbnailAnnotationStatus(source);
             if (hadImage) _selectedCount = Math.Max(0, _selectedCount - 1);
             ShowNotification($"選択済み保存先の画像とJSONを削除: {fileName}", NotificationKind.Success);
         }
@@ -939,7 +1123,7 @@ public partial class MainWindow : Window
     private async Task DeleteCurrentOriginalAsync()
     {
         if (_isClosing || _folderLoadInProgress || _fileOperationInProgress ||
-            _currentFolder is null || _imageFiles.Count == 0) return;
+            _currentFolder is null || !HasCurrentImage) return;
 
         var source = _imageFiles[_currentIndex];
         var fileName = Path.GetFileName(source);
@@ -977,10 +1161,11 @@ public partial class MainWindow : Window
             _metadataRequests.Remove(source);
             _imageFiles.RemoveAt(removedIndex);
             _thumbnailItems.RemoveAt(removedIndex);
+            _thumbnailItemsByPath.Remove(source);
             _currentIndex = Math.Min(removedIndex, Math.Max(0, _imageFiles.Count - 1));
             _highlightedThumbnail = null;
             _selectedCount = _thumbnailItems.Count(item => item.IsSaved);
-            RebuildThumbnailRows();
+            RefreshThumbnailFilter();
             RenderCurrentImage();
             ShowNotification($"元画像をごみ箱へ移動: {fileName}", NotificationKind.Success);
         }
@@ -1006,9 +1191,10 @@ public partial class MainWindow : Window
 
     private void NavigateAfterSelection()
     {
-        if (_currentIndex < _imageFiles.Count - 1)
+        var next = CurrentFilteredIndex + 1;
+        if (next >= 0 && next < _filteredThumbnailItems.Count)
         {
-            _currentIndex++;
+            _currentIndex = _thumbnailItems.IndexOf(_filteredThumbnailItems[next]);
             RenderCurrentImage();
         }
         else
