@@ -107,6 +107,32 @@
                             <TextBlock Text="✓ 選択済み" Foreground="#6EE7B7" FontSize="10" Margin="0,0,8,2" />
                             <TextBlock Text="✓ 注釈あり" Foreground="#93C5FD" FontSize="10" Margin="0,0,0,2"
                                        ToolTip="反映済みの下書きを含む。未保存の注釈は件数の * で確認" />
+                            <Button x:Name="ThumbnailSortButton" Content="名前↑" FontSize="10"
+                                    Height="18" MinWidth="44" Padding="3,0" Margin="6,0,0,2"
+                                    Foreground="#E2E8F0" Background="#334155" BorderBrush="#475569"
+                                    VerticalAlignment="Top" Focusable="False"
+                                    AutomationProperties.Name="サムネイルの並べ替え"
+                                    ToolTip="並べ替え: ファイル名の昇順（日付は画像ファイルの更新日時）"
+                                    Click="ThumbnailSortButton_Click">
+                                <Button.ContextMenu>
+                                    <ContextMenu>
+                                        <MenuItem Header="ファイル名の昇順" IsCheckable="True" IsChecked="True"
+                                                  Tag="{x:Static ui:ThumbnailSortOrder.FileNameAscending}"
+                                                  Click="ThumbnailSort_Changed" />
+                                        <MenuItem Header="ファイル名の降順" IsCheckable="True"
+                                                  Tag="{x:Static ui:ThumbnailSortOrder.FileNameDescending}"
+                                                  Click="ThumbnailSort_Changed" />
+                                        <MenuItem Header="日付の昇順（古い順）" IsCheckable="True"
+                                                  ToolTip="画像ファイルの更新日時"
+                                                  Tag="{x:Static ui:ThumbnailSortOrder.DateAscending}"
+                                                  Click="ThumbnailSort_Changed" />
+                                        <MenuItem Header="日付の降順（新しい順）" IsCheckable="True"
+                                                  ToolTip="画像ファイルの更新日時"
+                                                  Tag="{x:Static ui:ThumbnailSortOrder.DateDescending}"
+                                                  Click="ThumbnailSort_Changed" />
+                                    </ContextMenu>
+                                </Button.ContextMenu>
+                            </Button>
                         </WrapPanel>
 
                         <!-- タイルは行単位で仮想化。非表示の行は画像もUIも生成しない。 -->
