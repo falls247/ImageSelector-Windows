@@ -19,16 +19,18 @@ public sealed class ThumbnailItem : INotifyPropertyChanged
     private AnnotationStatus _annotationStatus;
     private ImageSource? _thumbnail;
 
-    public ThumbnailItem(string path, bool isSaved, bool hasMetadata = false)
+    public ThumbnailItem(string path, bool isSaved, DateTime lastWriteTimeUtc, bool hasMetadata = false)
     {
         Path = path;
         FileName = System.IO.Path.GetFileName(path);
+        LastWriteTimeUtc = lastWriteTimeUtc;
         _isSaved = isSaved;
         _annotationStatus = hasMetadata ? AnnotationStatus.Pending : AnnotationStatus.Empty;
     }
 
     public string Path { get; }
     public string FileName { get; }
+    public DateTime LastWriteTimeUtc { get; }
 
     // 読込済みのサムネイルだけ保持。フォルダを切り替えるとインスタンスごと解放する。
     public ImageSource? Thumbnail

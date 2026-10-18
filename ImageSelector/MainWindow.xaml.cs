@@ -36,6 +36,7 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<ThumbnailItem> _thumbnailItems = new();
     private readonly Dictionary<string, ThumbnailItem> _thumbnailItemsByPath = new(StringComparer.OrdinalIgnoreCase);
     private List<ThumbnailItem> _filteredThumbnailItems = new();
+    private ThumbnailSortOrder _thumbnailSortOrder = ThumbnailSortOrder.FileNameAscending;
     private List<ThumbnailRow> _thumbnailRows = new();
     private readonly DispatcherTimer _thumbnailLayoutTimer = new();
     private readonly DispatcherTimer _thumbnailFilterTimer = new();
@@ -246,17 +247,15 @@ public partial class MainWindow : Window
             // Directory enumeration and selected-copy scan can block on a slow disk/share.
             var (images, existingSelectedFiles) = await Task.Run(() =>
             {
-                var found = new List<string>();
+                var found = new List<(string Path, DateTime LastWriteTimeUtc)>();
                 var options = new EnumerationOptions { IgnoreInaccessible = true, RecurseSubdirectories = false };
-                foreach (var path in Directory.EnumerateFiles(fullFolder, "*", options))
+                foreach (var file in new DirectoryInfo(fullFolder).EnumerateFiles("*", options))
                 {
                     if ((found.Count & 127) == 0) token.ThrowIfCancellationRequested();
-                    if (!SupportedExtensions.Contains(Path.GetExtension(path))) continue;
+                    if (!SupportedExtensions.Contains(file.Extension)) continue;
                     if (found.Count >= 20000) throw new InvalidDataException("画像の上限20,000件を超えています");
-                    found.Add(path);
+                    found.Add((file.FullName, file.LastWriteTimeUtc));
                 }
-                found.Sort((left, right) => StringComparer.OrdinalIgnoreCase.Compare(
-                    Path.GetFileName(left), Path.GetFileName(right)));
                 token.ThrowIfCancellationRequested();
                 var selectedFolder = GetSelectedFolder(fullFolder);
                 var selected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -301,22 +300,22 @@ public partial class MainWindow : Window
             foreach (var name in existingSelectedFiles)
                 if (name.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
                     _metadataExists.Add(name);
-            _imageFiles = images;
-            _currentIndex = 0;
+            _imageFiles = images.Select(image => image.Path).ToList();
+            _currentIndex = -1;
             _highlightedThumbnail = null;
 
             _thumbnailItems.Clear();
             _thumbnailItemsByPath.Clear();
             foreach (var image in images)
             {
-                var item = new ThumbnailItem(image,
-                    existingSelectedFiles.Contains(Path.GetFileName(image)),
-                    _metadataExists.Contains(Path.GetFileName(image) + ".json"));
+                var item = new ThumbnailItem(image.Path,
+                    existingSelectedFiles.Contains(Path.GetFileName(image.Path)), image.LastWriteTimeUtc,
+                    _metadataExists.Contains(Path.GetFileName(image.Path) + ".json"));
                 _thumbnailItems.Add(item);
-                _thumbnailItemsByPath.Add(image, item);
+                _thumbnailItemsByPath.Add(image.Path, item);
             }
             _selectedCount = _thumbnailItems.Count(item => item.IsSaved);
-            RefreshThumbnailFilter();
+            ApplyThumbnailSort();
             FolderPathText.Text = fullFolder;
             FolderPathText.ToolTip = fullFolder;
             Title = $"Image Selector — 注釈付き選別 — {Path.GetFileName(Path.TrimEndingDirectorySeparator(fullFolder))}";
@@ -443,6 +442,55 @@ public partial class MainWindow : Window
         {
             if (acquired) _previewDecodeSlots.Release();
         }
+    }
+
+    private void ThumbnailSortButton_Click(object sender, RoutedEventArgs e)
+    {
+        var menu = ThumbnailSortButton.ContextMenu;
+        menu.PlacementTarget = ThumbnailSortButton;
+        menu.Placement = PlacementMode.Bottom;
+        menu.IsOpen = true;
+    }
+
+    private void ThumbnailSort_Changed(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuItem { Tag: ThumbnailSortOrder order }) return;
+        if (!_isClosing && !_fileOperationInProgress && !_folderLoadInProgress)
+            _thumbnailSortOrder = order;
+        foreach (MenuItem item in ThumbnailSortButton.ContextMenu.Items)
+            item.IsChecked = Equals(item.Tag, _thumbnailSortOrder);
+        ThumbnailSortButton.Content = _thumbnailSortOrder switch
+        {
+            ThumbnailSortOrder.FileNameDescending => "名前↓",
+            ThumbnailSortOrder.DateAscending => "日付↑",
+            ThumbnailSortOrder.DateDescending => "日付↓",
+            _ => "名前↑"
+        };
+        var selected = ThumbnailSortButton.ContextMenu.Items.Cast<MenuItem>().Single(item => item.IsChecked);
+        ThumbnailSortButton.ToolTip = $"並べ替え: {selected.Header}（日付は画像ファイルの更新日時）";
+        if (_isClosing || _fileOperationInProgress || _folderLoadInProgress) return;
+        ApplyThumbnailSort();
+        RenderCurrentImage();
+    }
+
+    private void ApplyThumbnailSort()
+    {
+        var current = HasCurrentImage ? _thumbnailItems[_currentIndex] : null;
+        var ordered = (_thumbnailSortOrder switch
+        {
+            ThumbnailSortOrder.FileNameDescending => _thumbnailItems.OrderByDescending(item => item.FileName, FileNameComparer.Instance),
+            ThumbnailSortOrder.DateAscending => _thumbnailItems.OrderBy(item => item.LastWriteTimeUtc)
+                .ThenBy(item => item.FileName, FileNameComparer.Instance),
+            ThumbnailSortOrder.DateDescending => _thumbnailItems.OrderByDescending(item => item.LastWriteTimeUtc)
+                .ThenBy(item => item.FileName, FileNameComparer.Instance),
+            _ => _thumbnailItems.OrderBy(item => item.FileName, FileNameComparer.Instance)
+        }).ToList();
+        // 画像とタイルの添字を揃え、保存・削除と前後移動にも表示順を使う。
+        _thumbnailItems.Clear();
+        foreach (var item in ordered) _thumbnailItems.Add(item);
+        _imageFiles = ordered.Select(item => item.Path).ToList();
+        _currentIndex = current is null ? 0 : _thumbnailItems.IndexOf(current);
+        RefreshThumbnailFilter();
     }
 
     private bool MatchesThumbnailFilter(ThumbnailItem item) =>
@@ -679,7 +727,7 @@ public partial class MainWindow : Window
                 item.Thumbnail is null && sender is Image image &&
                 ReferenceEquals(image.DataContext, item))
             {
-                Dispatcher.BeginInvoke(new Action(() =>
+                _ = Dispatcher.BeginInvoke(new Action(() =>
                 {
                     if (!_isClosing && item.RealizedCount > 0 &&
                         !item.IsLoading && item.Thumbnail is null)
@@ -713,6 +761,7 @@ public partial class MainWindow : Window
         ThumbnailList.IsHitTestVisible = hasImage && !busy;
         SelectedOnlyFilterCheckBox.IsEnabled = !busy;
         AnnotatedOnlyFilterCheckBox.IsEnabled = !busy;
+        ThumbnailSortButton.IsEnabled = !busy;
 
         PositionText.Text = hasImage ? $"{filteredIndex + 1}/{_filteredThumbnailItems.Count}" : "0/0";
         ThumbnailFilterStatusText.Text = $"表示 {_filteredThumbnailItems.Count}/{_imageFiles.Count}件"

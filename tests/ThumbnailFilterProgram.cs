@@ -71,6 +71,14 @@ internal static class ThumbnailFilterProgram
         checkbox.IsChecked = enabled;
         checkbox.RaiseEvent(new RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent));
     }
+    private static void SetSort(MainWindow window, ThumbnailSortOrder order)
+    {
+        var button = (Button)window.FindName("ThumbnailSortButton");
+        var selectedItem = button.ContextMenu.Items.Cast<MenuItem>().Single(item => Equals(item.Tag, order));
+        selectedItem.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+        Check(button.ContextMenu.Items.Cast<MenuItem>().Count(item => item.IsChecked) == 1 && selectedItem.IsChecked,
+            "sort menu checks only the active order: " + order);
+    }
     private static async Task CancelSelectionAsync(MainWindow window)
     {
         // この試験プロセス自身の、生成した画像の削除確認だけに応答する。
@@ -219,6 +227,161 @@ internal static class ThumbnailFilterProgram
                 "folder switch cancels old scan without restoring stale results");
             SetFilter(window, "AnnotatedOnlyFilterCheckBox", false);
             Check(Visible(window).Single().FileName == "other.png", "clearing filter recovers from no matching results in new folder");
+        }
+        finally
+        {
+            window.Close();
+            try { Directory.Delete(root, true); } catch (IOException) { }
+        }
+        await RunSortChecksAsync();
+    }
+
+    private static async Task RunSortChecksAsync()
+    {
+        var root = Path.Combine(AppContext.BaseDirectory, "sort-fixtures-" + Guid.NewGuid().ToString("N"));
+        var source = Path.Combine(root, "album");
+        var selected = source + "_selected";
+        var other = Path.Combine(root, "other");
+        var empty = Path.Combine(root, "empty");
+        Directory.CreateDirectory(source);
+        Directory.CreateDirectory(selected);
+        Directory.CreateDirectory(other);
+        Directory.CreateDirectory(empty);
+        var epoch = new DateTime(2024, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        var encoder = new PngBitmapEncoder();
+        encoder.Frames.Add(BitmapFrame.Create(BitmapSource.Create(2, 2, 96, 96, PixelFormats.Bgra32, null, new byte[16], 8)));
+        using var encodedImage = new MemoryStream();
+        encoder.Save(encodedImage);
+        var imageBytes = encodedImage.ToArray();
+        var fixtures = new[] { ("z.png", 0), ("image10.png", 3), ("b.png", 1), ("image2.png", 2), ("A.png", 1) };
+        foreach (var (name, days) in fixtures)
+        {
+            var path = Path.Combine(source, name);
+            File.WriteAllBytes(path, imageBytes);
+            File.SetLastWriteTimeUtc(path, epoch.AddDays(days));
+            if (name is "A.png" or "b.png" or "z.png") File.Copy(path, Path.Combine(selected, name));
+            if (name is "b.png" or "image2.png")
+                File.WriteAllText(Path.Combine(selected, name + ".json"), JsonSerializer.Serialize(new ImageMetadata
+                {
+                    ImageFile = name, Annotations = new() { new() { Text = "sort note" } }
+                }));
+        }
+        foreach (var name in new[] { "a.png", "z.png" })
+        {
+            var path = Path.Combine(other, name);
+            File.Copy(Path.Combine(source, "z.png"), path);
+            File.SetLastWriteTimeUtc(path, epoch.AddDays(name == "a.png" ? 1 : 0));
+        }
+
+        var window = new MainWindow { WindowStartupLocation = WindowStartupLocation.Manual,
+            Left = -20000, Top = -20000, Width = 1000, Height = 500, ShowInTaskbar = false, ShowActivated = false };
+        try
+        {
+            window.Show();
+            await CallAsync(window, "LoadFolderAsync", source);
+            Check(Visible(window).Select(item => item.FileName).SequenceEqual(new[] { "A.png", "b.png", "image2.png", "image10.png", "z.png" })
+                && Current(window) == "A.png", "default order is case-insensitive natural filename ascending");
+            Check(Visible(window).All(item => item.LastWriteTimeUtc == epoch.AddDays(fixtures.Single(fixture => fixture.Item1 == item.FileName).Item2)),
+                "date sorting uses original image modification timestamps");
+
+            var button = (Button)window.FindName("ThumbnailSortButton");
+            var panel = (WrapPanel)button.Parent;
+            ((Grid)window.Content).ColumnDefinitions[0].Width = new GridLength(210);
+            window.UpdateLayout();
+            var legend = (TextBlock)panel.Children[1];
+            var buttonOrigin = button.TranslatePoint(new Point(), panel);
+            Check(button.ActualWidth <= 44 && button.ActualHeight <= 18
+                && buttonOrigin.X >= legend.TranslatePoint(new Point(legend.ActualWidth, 0), panel).X
+                && buttonOrigin.X + button.ActualWidth <= panel.ActualWidth
+                && buttonOrigin.Y == legend.TranslatePoint(new Point(), panel).Y,
+                "compact sort button fits to the right of legends at minimum sidebar width");
+            button.RaiseEvent(new RoutedEventArgs(System.Windows.Controls.Primitives.ButtonBase.ClickEvent));
+            Check(button.ContextMenu.IsOpen && ReferenceEquals(button.ContextMenu.PlacementTarget, button),
+                "sort button opens its menu");
+            button.ContextMenu.IsOpen = false;
+
+            var orders = new[]
+            {
+                (ThumbnailSortOrder.FileNameDescending, new[] { "z.png", "image10.png", "image2.png", "b.png", "A.png" }),
+                (ThumbnailSortOrder.DateAscending, new[] { "z.png", "A.png", "b.png", "image2.png", "image10.png" }),
+                (ThumbnailSortOrder.DateDescending, new[] { "image10.png", "image2.png", "A.png", "b.png", "z.png" }),
+                (ThumbnailSortOrder.FileNameAscending, new[] { "A.png", "b.png", "image2.png", "image10.png", "z.png" })
+            };
+            foreach (var (order, expected) in orders)
+            {
+                SetSort(window, order);
+                Check(Visible(window).Select(item => item.FileName).SequenceEqual(expected), "thumbnail order: " + order);
+                Check(Current(window) == "A.png" && Visible(window).Single(item => item.IsCurrent).FileName == "A.png",
+                    "sort preserves current image and highlight: " + order);
+                Check(Field<List<string>>(window, "_imageFiles").SequenceEqual(
+                    Field<IEnumerable<ThumbnailItem>>(window, "_thumbnailItems").Select(item => item.Path)),
+                    "sort keeps image and thumbnail indexes aligned: " + order);
+            }
+            SetSort(window, ThumbnailSortOrder.FileNameAscending);
+            SetSort(window, ThumbnailSortOrder.DateDescending);
+            Call(window, "Navigate", 1);
+            Check(Current(window) == "b.png", "navigation follows date order");
+            await CallAsync(window, "SelectCurrentAsync");
+            Check(Current(window) == "z.png", "save advances in date order");
+            SetFilter(window, "SelectedOnlyFilterCheckBox", true);
+            Check(Visible(window).Select(item => item.FileName).SequenceEqual(new[] { "A.png", "b.png", "z.png" }),
+                "selected filter retains date order");
+            SetFilter(window, "AnnotatedOnlyFilterCheckBox", true);
+            await SettleAsync(window);
+            Check(Visible(window).Single().FileName == "b.png" && Current(window) == "b.png", "both filters work with date order");
+            SetFilter(window, "SelectedOnlyFilterCheckBox", false);
+            await SettleAsync(window);
+            Check(Visible(window).Select(item => item.FileName).SequenceEqual(new[] { "image2.png", "b.png" }),
+                "annotation filter retains date order");
+            Call(window, "Navigate", -1);
+            await CallAsync(window, "SelectCurrentAsync");
+            Check(Current(window) == "b.png" && File.Exists(Path.Combine(selected, "image2.png")),
+                "sorted save writes the displayed image and advances to next match");
+            SetFilter(window, "SelectedOnlyFilterCheckBox", true);
+            await SettleAsync(window);
+            await CancelSelectionAsync(window);
+            Check(Current(window) == "image2.png" && Visible(window).Single().FileName == "image2.png",
+                "removing the last sorted match falls back to previous visible image");
+            SetSort(window, ThumbnailSortOrder.FileNameDescending);
+            Check(Visible(window).Single().FileName == "image2.png", "sort preserves active filters");
+            SetFilter(window, "SelectedOnlyFilterCheckBox", false);
+            SetFilter(window, "AnnotatedOnlyFilterCheckBox", false);
+            SetSort(window, ThumbnailSortOrder.DateAscending);
+            await CallAsync(window, "LoadFolderAsync", other);
+            Check(Visible(window).Select(item => item.FileName).SequenceEqual(new[] { "z.png", "a.png" }) && Current(window) == "z.png",
+                "new folder retains chosen order and displays its first image");
+            await CallAsync(window, "LoadFolderAsync", empty);
+            SetSort(window, ThumbnailSortOrder.FileNameDescending);
+            Check(Visible(window).Count == 0 && Current(window) == "", "sorting empty folder keeps preview empty");
+
+            var numeric = Path.Combine(root, "numeric");
+            Directory.CreateDirectory(numeric);
+            var naturalNames = new[]
+            {
+                "Upscale_78238_ (1).png", "Upscale_78238_ (2).png", "Upscale_78238_ (10).png", "Upscale_107523_.png"
+            };
+            foreach (var name in naturalNames.Reverse())
+            {
+                var path = Path.Combine(numeric, name);
+                File.WriteAllBytes(path, imageBytes);
+                File.SetLastWriteTimeUtc(path, epoch);
+            }
+            SetSort(window, ThumbnailSortOrder.FileNameAscending);
+            await CallAsync(window, "LoadFolderAsync", numeric);
+            Check(Visible(window).Select(item => item.FileName).SequenceEqual(naturalNames)
+                && Current(window) == "Upscale_78238_ (1).png",
+                "natural filename ascending orders 78238 before 107523 and (2) before (10)");
+            SetSort(window, ThumbnailSortOrder.FileNameDescending);
+            Check(Visible(window).Select(item => item.FileName).SequenceEqual(naturalNames.Reverse()),
+                "natural filename descending reverses numeric order");
+            Call(window, "Navigate", -1);
+            Check(Current(window) == "Upscale_78238_ (2).png", "navigation follows descending natural filename order");
+            foreach (var order in new[] { ThumbnailSortOrder.DateAscending, ThumbnailSortOrder.DateDescending })
+            {
+                SetSort(window, order);
+                Check(Visible(window).Select(item => item.FileName).SequenceEqual(naturalNames),
+                    "equal timestamps use natural filename order: " + order);
+            }
         }
         finally
         {
