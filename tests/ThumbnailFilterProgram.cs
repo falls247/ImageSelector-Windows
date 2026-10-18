@@ -279,8 +279,8 @@ internal static class ThumbnailFilterProgram
         {
             window.Show();
             await CallAsync(window, "LoadFolderAsync", source);
-            Check(Visible(window).Select(item => item.FileName).SequenceEqual(new[] { "A.png", "b.png", "image10.png", "image2.png", "z.png" })
-                && Current(window) == "A.png", "default order is case-insensitive filename ascending");
+            Check(Visible(window).Select(item => item.FileName).SequenceEqual(new[] { "A.png", "b.png", "image2.png", "image10.png", "z.png" })
+                && Current(window) == "A.png", "default order is case-insensitive natural filename ascending");
             Check(Visible(window).All(item => item.LastWriteTimeUtc == epoch.AddDays(fixtures.Single(fixture => fixture.Item1 == item.FileName).Item2)),
                 "date sorting uses original image modification timestamps");
 
@@ -302,10 +302,10 @@ internal static class ThumbnailFilterProgram
 
             var orders = new[]
             {
-                (ThumbnailSortOrder.FileNameDescending, new[] { "z.png", "image2.png", "image10.png", "b.png", "A.png" }),
+                (ThumbnailSortOrder.FileNameDescending, new[] { "z.png", "image10.png", "image2.png", "b.png", "A.png" }),
                 (ThumbnailSortOrder.DateAscending, new[] { "z.png", "A.png", "b.png", "image2.png", "image10.png" }),
                 (ThumbnailSortOrder.DateDescending, new[] { "image10.png", "image2.png", "A.png", "b.png", "z.png" }),
-                (ThumbnailSortOrder.FileNameAscending, new[] { "A.png", "b.png", "image10.png", "image2.png", "z.png" })
+                (ThumbnailSortOrder.FileNameAscending, new[] { "A.png", "b.png", "image2.png", "image10.png", "z.png" })
             };
             foreach (var (order, expected) in orders)
             {
@@ -353,6 +353,35 @@ internal static class ThumbnailFilterProgram
             await CallAsync(window, "LoadFolderAsync", empty);
             SetSort(window, ThumbnailSortOrder.FileNameDescending);
             Check(Visible(window).Count == 0 && Current(window) == "", "sorting empty folder keeps preview empty");
+
+            var numeric = Path.Combine(root, "numeric");
+            Directory.CreateDirectory(numeric);
+            var naturalNames = new[]
+            {
+                "Upscale_78238_ (1).png", "Upscale_78238_ (2).png", "Upscale_78238_ (10).png", "Upscale_107523_.png"
+            };
+            foreach (var name in naturalNames.Reverse())
+            {
+                var path = Path.Combine(numeric, name);
+                File.WriteAllBytes(path, imageBytes);
+                File.SetLastWriteTimeUtc(path, epoch);
+            }
+            SetSort(window, ThumbnailSortOrder.FileNameAscending);
+            await CallAsync(window, "LoadFolderAsync", numeric);
+            Check(Visible(window).Select(item => item.FileName).SequenceEqual(naturalNames)
+                && Current(window) == "Upscale_78238_ (1).png",
+                "natural filename ascending orders 78238 before 107523 and (2) before (10)");
+            SetSort(window, ThumbnailSortOrder.FileNameDescending);
+            Check(Visible(window).Select(item => item.FileName).SequenceEqual(naturalNames.Reverse()),
+                "natural filename descending reverses numeric order");
+            Call(window, "Navigate", -1);
+            Check(Current(window) == "Upscale_78238_ (2).png", "navigation follows descending natural filename order");
+            foreach (var order in new[] { ThumbnailSortOrder.DateAscending, ThumbnailSortOrder.DateDescending })
+            {
+                SetSort(window, order);
+                Check(Visible(window).Select(item => item.FileName).SequenceEqual(naturalNames),
+                    "equal timestamps use natural filename order: " + order);
+            }
         }
         finally
         {

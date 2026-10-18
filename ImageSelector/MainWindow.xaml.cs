@@ -478,12 +478,12 @@ public partial class MainWindow : Window
         var current = HasCurrentImage ? _thumbnailItems[_currentIndex] : null;
         var ordered = (_thumbnailSortOrder switch
         {
-            ThumbnailSortOrder.FileNameDescending => _thumbnailItems.OrderByDescending(item => item.FileName, StringComparer.OrdinalIgnoreCase),
+            ThumbnailSortOrder.FileNameDescending => _thumbnailItems.OrderByDescending(item => item.FileName, FileNameComparer.Instance),
             ThumbnailSortOrder.DateAscending => _thumbnailItems.OrderBy(item => item.LastWriteTimeUtc)
-                .ThenBy(item => item.FileName, StringComparer.OrdinalIgnoreCase),
+                .ThenBy(item => item.FileName, FileNameComparer.Instance),
             ThumbnailSortOrder.DateDescending => _thumbnailItems.OrderByDescending(item => item.LastWriteTimeUtc)
-                .ThenBy(item => item.FileName, StringComparer.OrdinalIgnoreCase),
-            _ => _thumbnailItems.OrderBy(item => item.FileName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(item => item.FileName, FileNameComparer.Instance),
+            _ => _thumbnailItems.OrderBy(item => item.FileName, FileNameComparer.Instance)
         }).ToList();
         // 画像とタイルの添字を揃え、保存・削除と前後移動にも表示順を使う。
         _thumbnailItems.Clear();
